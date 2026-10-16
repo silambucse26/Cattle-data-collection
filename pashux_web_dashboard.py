@@ -260,14 +260,21 @@ async def get_cctv_mjpeg_stream():
     """MJPEG Live video stream with AI detection overlays for the browser."""
     def frame_generator():
         global current_live_frame
+        idle_count = 0
         while True:
             with live_stream_lock:
                 if current_live_frame is not None:
+                    idle_count = 0
                     ret, jpeg = cv2.imencode(".jpg", current_live_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     if ret:
                         frame_bytes = jpeg.tobytes()
                         yield (b"--frame\r\n"
                                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+                else:
+                    idle_count += 1
+            if not active_monitoring_state.get("is_running", False) and idle_count > 25:
+                # Video analysis finished and closed cleanly - close stream
+                break
             time.sleep(0.04) # ~25 fps
 
     return StreamingResponse(frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
@@ -405,8 +412,12 @@ def ai_video_monitoring_loop(
         while not stop_event.is_set():
             ret, frame = cap.read()
             if not ret or frame is None:
-                if source_type == "uploaded":
-                    print(f"[PashuX AI] Uploaded video playback finished ({frame_count} frames).")
+                is_file = isinstance(source_path, str) and (
+                    os.path.isfile(source_path) or
+                    any(source_path.lower().endswith(ext) for ext in [".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"])
+                )
+                if source_type == "uploaded" or is_file:
+                    print(f"[PashuX AI] Video playback completed ({frame_count} frames analyzed). Closing cleanly...")
                     break
                 else:
                     time.sleep(0.02)
@@ -629,6 +640,12 @@ def ai_video_monitoring_loop(
         except Exception as e:
             print(f"[PashuX AI] Session finalization notice: {e}")
 
+        # Automatically sync local activities and images/videos to Supabase
+        try:
+            supabase_manager.sync_local_to_supabase()
+        except Exception as e:
+            print(f"[PashuX AI] Supabase sync notice: {e}")
+
         # Successful completion
         total_time = max(0.1, time.time() - loop_start_time)
         final_fps = round(frame_count / total_time, 2)
@@ -648,10 +665,12 @@ def ai_video_monitoring_loop(
             engine.finalize_all_sessions(current_video_sec=video_sec, video_base_dt=video_base_dt)
         except Exception:
             pass
-        time.sleep(2.0)  # Allow background video encoding worker to complete active 10s clips
+        with live_stream_lock:
+            current_live_frame = None
+        time.sleep(1.0)
         active_monitoring_state["is_running"] = False
-        active_monitoring_state["status_text"] = f"Finished ({frame_count} frames processed & uploaded)"
-        print(f"[PashuX AI] Monitoring loop exited cleanly.")
+        active_monitoring_state["status_text"] = f"Finished ({frame_count} frames analyzed & data stored)"
+        print(f"[PashuX AI] Video analysis completed and closed cleanly.")
 
 
 def process_video_job_callback(job: Dict[str, Any]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
@@ -934,6 +953,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       --font-sans: 'Plus Jakarta Sans', sans-serif;
       --font-mono: 'JetBrains Mono', monospace;
     }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background-color: var(--bg-dark);
@@ -1280,6 +1300,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </button>
       </div>
     </section>
+
+    <!-- Video Analysis Progress Notification Banner -->
+    <div id="videoJobBanner" style="display: none; background: rgba(124, 77, 255, 0.15); border: 1px solid rgba(124, 77, 255, 0.4); border-radius: 12px; padding: 1.1rem 1.4rem; margin-bottom: 1.5rem;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <span id="jobSpinner" style="display: inline-block; font-size: 1.1rem; animation: spin 1s linear infinite;">⏳</span>
+          <span id="jobBannerText" style="font-weight: 600; font-size: 0.95rem; color: #fff;">Analyzing video...</span>
+        </div>
+        <span id="jobPercentText" style="font-family: var(--font-mono); font-weight: 700; color: #00e59b; font-size: 1rem;">0%</span>
+      </div>
+      <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden;">
+        <div id="jobProgressBarFill" style="width: 0%; height: 100%; background: linear-gradient(90deg, #7c4dff, #00e59b); transition: width 0.3s ease;"></div>
+      </div>
+    </div>
 
     <!-- Live Stream Preview Window -->
     <section class="stream-box" id="streamBox">
@@ -1891,10 +1925,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.success) {
-          alert(data.message);
           closeModal("uploadModal");
-          toggleLiveStream();
-          fetchActivities();
+          if (data.job_id) {
+            trackVideoAnalysisJob(data.job_id, file.name);
+          } else {
+            alert(data.message);
+            fetchActivities();
+          }
         } else {
           alert(data.detail || "Upload failed");
         }
@@ -1904,6 +1941,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         prog.style.display = "none";
         btn.disabled = false;
       }
+    }
+
+    function trackVideoAnalysisJob(jobId, filename) {
+      const banner = document.getElementById("videoJobBanner");
+      const text = document.getElementById("jobBannerText");
+      const pct = document.getElementById("jobPercentText");
+      const bar = document.getElementById("jobProgressBarFill");
+      const spinner = document.getElementById("jobSpinner");
+
+      banner.style.display = "block";
+      text.innerText = `Analyzing '${filename}' - Processing cattle herd activities & duration...`;
+      pct.innerText = "0%";
+      bar.style.width = "0%";
+      spinner.style.display = "inline-block";
+
+      const pollInterval = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/jobs/${jobId}`, { headers: getAuthHeaders() });
+          if (!res.ok) return;
+          const job = await res.json();
+          const p = Math.round(job.progress_percent || 0);
+          pct.innerText = `${p}%`;
+          bar.style.width = `${p}%`;
+          text.innerText = `Analyzing '${filename}' (${job.frames_processed || 0}/${job.total_frames || 0} frames @ ${job.analyzed_fps || 0} FPS)...`;
+
+          if (job.status === "completed") {
+            clearInterval(pollInterval);
+            pct.innerText = "100%";
+            bar.style.width = "100%";
+            spinner.style.display = "none";
+            text.innerHTML = `✅ <b>Analysis Complete!</b> Video closed cleanly. All cattle feeding, resting, and health data stored in Supabase.`;
+            if (isLiveStreamOpen) {
+              toggleLiveStream();
+            }
+            fetchActivities();
+            setTimeout(() => {
+              banner.style.display = "none";
+            }, 6000);
+          } else if (job.status === "failed") {
+            clearInterval(pollInterval);
+            spinner.style.display = "none";
+            text.innerHTML = `❌ Analysis stopped: ${job.error || 'Failed'}`;
+            fetchActivities();
+          }
+        } catch (e) {
+          console.error("Job poll error:", e);
+        }
+      }, 800);
     }
 
     checkUserSession();

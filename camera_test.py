@@ -2162,22 +2162,37 @@ def main():
             else:
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    print("\n[!] Video playback completed. Finalizing Screen Recording & Report...")
+                    print("\n[!] Video playback completed. Finalizing activity sessions, recordings & report...")
                     if video_writer is not None and video_writer.isOpened():
                         video_writer.release()
                         video_writer = None
+
+                    # Finalize all open activity engine sessions (feeding, resting, health)
+                    try:
+                        video_sec = float(frame_count) / max(1.0, fps)
+                        activity_engine.finalize_all_sessions(current_video_sec=video_sec)
+                    except Exception as e:
+                        print(f"[ActivityEngine] Session finalization notice: {e}")
+
+                    summary_img = render_end_of_video_summary(
+                        source_path, frame_count, fps, unique_cattle_seen,
+                        cattle_profiles, breed_summary, bcs_summary, disease_summary, avg_herd_bcs,
+                        unique_humans_seen=unique_humans_seen
+                    )
                     export_summary_report(
                         source_path, frame_count, fps, unique_cattle_seen,
                         cattle_profiles, breed_summary, bcs_summary, disease_summary,
-                        avg_herd_bcs, render_end_of_video_summary(
-                            source_path, frame_count, fps, unique_cattle_seen,
-                            cattle_profiles, breed_summary, bcs_summary, disease_summary, avg_herd_bcs,
-                            unique_humans_seen=unique_humans_seen
-                        ), analyzed_video_path,
+                        avg_herd_bcs, summary_img, analyzed_video_path,
                         unique_humans_seen=unique_humans_seen
                     )
+                    print("\n[✓] Video analysis completed. All data stored in Supabase & local cache. Closing cleanly...")
+                    try:
+                        cv2.imshow(WINDOW_TITLE, summary_img)
+                        cv2.waitKey(2000)
+                    except Exception:
+                        pass
                     video_ended = True
-                    continue
+                    break
 
             if not ret or frame is None:
                 time.sleep(0.01)
