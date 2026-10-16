@@ -1011,6 +1011,19 @@ class EstrusDetector:
                                     behavior_type = "Ano-Genital Sniffing (Estrus Sign)"
                                     estrus_conf = min(0.96, max(0.88, t_i.get("heat_conf", 0.0), t_j.get("heat_conf", 0.0)))
 
+                    # 3C. Genuine Standing Heat & Chin-Resting / Courting Contact:
+                    if not is_mounting and not is_sniffing:
+                        h_gap = max(0, max(x1_i, x1_j) - min(x2_i, x2_j))
+                        v_overlap = max(0, min(y2_i, y2_j) - max(y1_i, y1_j)) / float(min(h_i, h_j))
+                        if (iomin >= 0.06 or (h_gap <= 40 and v_overlap >= 0.25)):
+                            ar_i = float(w_i) / float(h_i)
+                            ar_j = float(w_j) / float(h_j)
+                            if 0.65 <= ar_i <= 1.90 and 0.65 <= ar_j <= 1.90:
+                                if abs(cy_i - cy_j) <= max(h_i, h_j) * 0.60:
+                                    is_mounting = True
+                                    behavior_type = "Standing Heat / Chin Resting (Estrus Sign)"
+                                    estrus_conf = min(0.94, max(0.85, 0.80 + (iomin * 0.20)))
+
                     if is_mounting or is_sniffing:
                         event_data = {
                             "mounting_id": id_i,

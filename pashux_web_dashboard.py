@@ -306,11 +306,14 @@ def start_monitoring_worker(source_path: str, source_type: str, farm_id: str, ca
     t.start()
 
 
-def check_cattle_mounting(c1: Dict[str, Any], c2: Dict[str, Any]) -> Tuple[bool, float]:
+def check_cattle_estrus_behavior(c1: Dict[str, Any], c2: Dict[str, Any]) -> Tuple[bool, str, float]:
     """
-    Evaluates kinematic criteria for genuine mounting / estrus behavior:
-    1. Substantial 2D overlap between cattle bodies
-    2. Mounting cow is reared up (top is elevated, center is higher, lower body overlaps mounted cow)
+    Evaluates kinematic criteria for genuine estrus signs between 2 distinct cattle:
+    1. Active Mounting / Rearing:
+       - Overlap + elevated posture (top of mounting cow is higher, lower body overlaps mounted cow)
+    2. Standing Heat & Chin-Resting / Heat Interaction:
+       - Mutual close physical interaction where one cow rests chin/head over the back, withers, or neck of the other
+       - Bounding boxes in direct contact/overlap, standing heat posture
     """
     box1, box2 = c1.get("box", [0, 0, 0, 0]), c2.get("box", [0, 0, 0, 0])
     x1_1, y1_1, x2_1, y2_1 = box1
@@ -319,33 +322,41 @@ def check_cattle_mounting(c1: Dict[str, Any], c2: Dict[str, Any]) -> Tuple[bool,
     w1, h1 = max(1, x2_1 - x1_1), max(1, y2_1 - y1_1)
     w2, h2 = max(1, x2_2 - x1_2), max(1, y2_2 - y1_2)
 
-    if min(w1, h1, w2, h2) < 40:
-        return False, 0.0
+    if min(w1, h1, w2, h2) < 35:
+        return False, "", 0.0
 
     inter_x = max(0, min(x2_1, x2_2) - max(x1_1, x1_2))
     inter_y = max(0, min(y2_1, y2_2) - max(y1_1, y1_2))
     inter_area = inter_x * inter_y
-    if inter_area <= 0:
-        return False, 0.0
 
     min_area = min(w1 * h1, w2 * h2)
-    iomin = inter_area / float(min_area)
+    iomin = (inter_area / float(min_area)) if min_area > 0 else 0.0
 
     cx1, cy1 = (x1_1 + x2_1) / 2.0, (y1_1 + y2_1) / 2.0
     cx2, cy2 = (x1_2 + x2_2) / 2.0, (y1_2 + y2_2) / 2.0
 
-    # Horizontal center alignment check
-    if abs(cx1 - cx2) > max(w1, w2) * 0.65:
-        return False, 0.0
+    # Horizontal distance between box edges
+    h_gap = max(0, max(x1_1, x1_2) - min(x2_1, x2_2))
+    v_overlap = inter_y / float(min(h1, h2))
 
-    # Cow 1 mounting Cow 2:
-    # Top is significantly higher, center is higher, bottom overlaps mounted cow
+    # 1. Active Mounting (One cow mounted on top of another)
     elevation_diff = y1_2 - y1_1
-    if (iomin >= 0.35) and (elevation_diff >= min(h1, h2) * 0.25) and (cy1 < cy2) and (y2_1 > y1_2 + min(h1, h2) * 0.20):
-        conf = min(0.96, max(0.85, 0.78 + (iomin * 0.18)))
-        return True, conf
+    if (iomin >= 0.16) and (cy1 < cy2) and (elevation_diff >= min(h1, h2) * 0.08) and (y2_1 > y1_2):
+        conf = min(0.97, max(0.85, 0.80 + (iomin * 0.20)))
+        return True, "Active Mounting / Standing Heat", conf
 
-    return False, 0.0
+    # 2. Standing Heat & Chin-Resting / Head-Over-Withers interaction
+    # (Two standing cows in close physical contact with chin/head on shoulder/neck/rump)
+    is_close_contact = (iomin >= 0.06) or (h_gap <= 40 and v_overlap >= 0.25)
+    if is_close_contact:
+        ar1 = float(w1) / float(h1)
+        ar2 = float(w2) / float(h2)
+        if 0.65 <= ar1 <= 1.90 and 0.65 <= ar2 <= 1.90:
+            if abs(cy1 - cy2) <= max(h1, h2) * 0.60:
+                conf = min(0.92, max(0.82, 0.78 + (iomin * 0.25)))
+                return True, "Standing Heat / Chin Resting", conf
+
+    return False, "", 0.0
 
 
 def ai_video_monitoring_loop(
@@ -556,7 +567,7 @@ def ai_video_monitoring_loop(
 
                 video_sec = round(float(frame_count) / max(1.0, fps), 2)
 
-                # 5. Genuine Kinematic Mounting & Estrus Detection (Requires 2+ distinct cattle with physical mounting posture)
+                # 5. Genuine Kinematic Mounting & Estrus Detection (Active Mounting + Standing Heat & Chin-Resting)
                 estrus_events = []
                 if len(cattle_tracks) >= 2:
                     for i in range(len(cattle_tracks)):
@@ -565,17 +576,17 @@ def ai_video_monitoring_loop(
                                 continue
                             c_m = cattle_tracks[i]
                             c_f = cattle_tracks[j]
-                            is_mount, m_conf = check_cattle_mounting(c_m, c_f)
-                            pair_key = (c_m["id"], c_f["id"])
-                            if is_mount:
+                            is_estrus, estrus_type, e_conf = check_cattle_estrus_behavior(c_m, c_f)
+                            pair_key = (min(c_m["id"], c_f["id"]), max(c_m["id"], c_f["id"]))
+                            if is_estrus:
                                 mounting_streaks[pair_key] = mounting_streaks.get(pair_key, 0) + 1
-                                # Confirmed mounting after at least 12 consecutive frames (~0.8s)
-                                if mounting_streaks[pair_key] >= 12:
+                                # Confirmed estrus after at least 3 consecutive inferences (~0.25s)
+                                if mounting_streaks[pair_key] >= 3:
                                     estrus_events.append({
                                         "mounting_id": c_m["id"],
                                         "mounted_id": c_f["id"],
-                                        "conf": round(m_conf, 2),
-                                        "behavior": "Active Mounting / Standing Heat"
+                                        "conf": round(e_conf, 2),
+                                        "behavior": estrus_type
                                     })
                             else:
                                 if pair_key in mounting_streaks:
@@ -802,6 +813,93 @@ async def list_activities(
     resting_count = sum(1 for a in activities if a.get("activity_type") == "resting_activity")
     worker_count = sum(1 for a in activities if a.get("activity_type") in ("worker_entry", "worker_exit", "cleaning_activity"))
 
+    # Build Deduplicated Cattle Registry & Camera Intelligence
+    cattle_registry: Dict[str, Dict[str, Any]] = {}
+    worker_registry: Dict[str, Dict[str, Any]] = {}
+    cameras_summary: Dict[str, Dict[str, Any]] = {}
+
+    for a in activities:
+        cam = a.get("camera_id") or "CAM01"
+        if cam not in cameras_summary:
+            cameras_summary[cam] = {
+                "camera_id": cam,
+                "cattle_ids": set(),
+                "estrus_detected": False,
+                "estrus_count": 0,
+                "feeding_duration_sec": 0.0,
+                "resting_duration_sec": 0.0,
+                "workers": set(),
+                "activities_count": 0
+            }
+        c_sum = cameras_summary[cam]
+        c_sum["activities_count"] += 1
+
+        # Track Cattle (Deduplicated by cattle_id)
+        c_id = a.get("cattle_id")
+        if c_id and (c_id.startswith("COW") or "cow" in c_id.lower() or c_id.isdigit()):
+            norm_cid = c_id if c_id.startswith("COW") else f"COW{int(c_id):03d}" if c_id.isdigit() else c_id
+            c_sum["cattle_ids"].add(norm_cid)
+            if norm_cid not in cattle_registry:
+                cattle_registry[norm_cid] = {
+                    "cattle_id": norm_cid,
+                    "camera_id": cam,
+                    "breed": a.get("breed") or "Cattle",
+                    "disease_status": a.get("disease_status") or "Healthy",
+                    "bcs_score": round(float(a.get("bcs_score") or 3.0), 1),
+                    "estimated_weight_kg": round(float(a.get("estimated_weight_kg") or 400.0), 1),
+                    "estimated_height_cm": round(float(a.get("estimated_height_cm") or 130.0), 1),
+                    "image_url": a.get("image_url") or "",
+                    "total_eating_sec": 0.0,
+                    "total_resting_sec": 0.0,
+                    "has_estrus": False,
+                    "last_seen": a.get("start_time") or a.get("created_at")
+                }
+            c_rec = cattle_registry[norm_cid]
+            if a.get("activity_type") == "feeding_activity":
+                c_rec["total_eating_sec"] += float(a.get("eating_duration_sec") or a.get("activity_duration") or 0.0)
+            elif a.get("activity_type") == "resting_activity":
+                c_rec["total_resting_sec"] += float(a.get("resting_duration_sec") or a.get("activity_duration") or 0.0)
+            elif a.get("activity_type") == "estrus_detected":
+                c_rec["has_estrus"] = True
+
+        # Track Workers (Deduplicated by worker_id)
+        w_id = a.get("worker_id")
+        if w_id:
+            c_sum["workers"].add(w_id)
+            if w_id not in worker_registry:
+                worker_registry[w_id] = {
+                    "worker_id": w_id,
+                    "camera_id": cam,
+                    "image_url": a.get("image_url") or "",
+                    "first_seen": a.get("start_time") or a.get("created_at"),
+                    "activity_type": a.get("activity_type"),
+                    "description": a.get("description")
+                }
+
+        # Track Estrus per Camera
+        if a.get("activity_type") == "estrus_detected":
+            c_sum["estrus_detected"] = True
+            c_sum["estrus_count"] += 1
+
+        c_sum["feeding_duration_sec"] += float(a.get("eating_duration_sec") or 0.0)
+        c_sum["resting_duration_sec"] += float(a.get("resting_duration_sec") or 0.0)
+
+    # Serialize camera summaries
+    serialized_cameras = []
+    for cam_id, cs in cameras_summary.items():
+        serialized_cameras.append({
+            "camera_id": cam_id,
+            "unique_cattle_count": len(cs["cattle_ids"]),
+            "cattle_ids": sorted(list(cs["cattle_ids"])),
+            "estrus_detected": cs["estrus_detected"],
+            "estrus_count": cs["estrus_count"],
+            "feeding_duration_sec": round(cs["feeding_duration_sec"], 1),
+            "resting_duration_sec": round(cs["resting_duration_sec"], 1),
+            "workers_count": len(cs["workers"]),
+            "worker_ids": sorted(list(cs["workers"])),
+            "activities_count": cs["activities_count"]
+        })
+
     return {
         "farm_id": farm_id,
         "total": total_count,
@@ -811,8 +909,13 @@ async def list_activities(
             "calving_count": calving_count,
             "feeding_count": feeding_count,
             "resting_count": resting_count,
-            "worker_count": worker_count
+            "worker_count": worker_count,
+            "unique_cattle_count": len(cattle_registry),
+            "unique_worker_count": len(worker_registry)
         },
+        "camera_summaries": serialized_cameras,
+        "cattle_registry": list(cattle_registry.values()),
+        "worker_registry": list(worker_registry.values()),
         "activities": activities
     }
 
@@ -1352,6 +1455,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- Daily Camera & Cattle Herd Intelligence Registry -->
+    <section class="camera-summary-box" style="background: rgba(22, 27, 34, 0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; padding: 1.4rem; margin-bottom: 1.5rem;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 0.8rem; flex-wrap: wrap; gap: 0.5rem;">
+        <div>
+          <h3 style="font-size: 1.15rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem;">
+            <span>📸</span> Today's Camera Cattle Registry & Heat Status
+          </h3>
+          <p style="font-size: 0.82rem; color: var(--text-muted); margin-top: 0.2rem;">
+            Deduplicated real-time cattle count, breed profiles, estrus monitoring & worker attendance per camera.
+          </p>
+        </div>
+        <div id="cameraStatusPill" style="padding: 0.35rem 0.85rem; border-radius: 20px; font-weight: 700; font-size: 0.82rem; font-family: var(--font-mono); background: rgba(0, 229, 155, 0.15); color: #00e59b; border: 1px solid rgba(0, 229, 155, 0.3);">
+          Zero-Duplicate Active Registry
+        </div>
+      </div>
+
+      <div id="cameraSummaryCards" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 1.2rem;">
+        <!-- Filled by JS -->
+      </div>
+
+      <div style="margin-top: 1rem;">
+        <div style="font-size: 0.9rem; font-weight: 700; color: #fff; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 0.4rem;">
+          <span>🐄</span> Registered Cattle Roster (Individual Breed, BCS & Duration Ledger)
+        </div>
+        <div id="cattleRosterList" style="display: flex; gap: 0.8rem; overflow-x: auto; padding-bottom: 0.5rem;">
+          <!-- Filled by JS -->
+        </div>
+      </div>
+    </section>
+
     <!-- Filter & Search Section -->
     <section class="filter-section">
       <div class="filter-group">
@@ -1618,6 +1751,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = await res.json();
         activitiesCache = data.activities || [];
         renderActivities(activitiesCache);
+        renderCameraSummaries(data.camera_summaries, data.cattle_registry, data.worker_registry);
 
         if (data.metrics) {
           document.getElementById("statEstrus").innerText = data.metrics.estrus_count || 0;
@@ -1632,6 +1766,90 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("totalBadge").innerText = `${activitiesCache.length} Events`;
       } catch (err) {
         console.error("Error fetching activities:", err);
+      }
+    }
+
+    function renderCameraSummaries(cameraSummaries, cattleRegistry, workerRegistry) {
+      const summaryContainer = document.getElementById("cameraSummaryCards");
+      const rosterContainer = document.getElementById("cattleRosterList");
+      if (!summaryContainer || !rosterContainer) return;
+
+      summaryContainer.innerHTML = "";
+      rosterContainer.innerHTML = "";
+
+      if (!cameraSummaries || cameraSummaries.length === 0) {
+        summaryContainer.innerHTML = `
+          <div style="grid-column: 1/-1; padding: 1.2rem; text-align: center; color: var(--text-muted); font-size: 0.88rem; background: rgba(255,255,255,0.02); border-radius: 8px;">
+            No cameras registered yet. Connect CCTV camera or upload a video recording to view daily herd registry.
+          </div>
+        `;
+      } else {
+        cameraSummaries.forEach(cs => {
+          const card = document.createElement("div");
+          card.style = "background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 1.1rem;";
+          
+          const estrusBadge = cs.estrus_detected ? 
+            `<span style="background: rgba(255, 68, 68, 0.2); color: #ff5252; border: 1px solid rgba(255,68,68,0.4); padding: 0.25rem 0.65rem; border-radius: 6px; font-weight: 700; font-size: 0.78rem;">🔥 ESTRUS DETECTED (${cs.estrus_count} events)</span>` : 
+            `<span style="background: rgba(0, 229, 155, 0.15); color: #00e59b; border: 1px solid rgba(0, 229, 155, 0.3); padding: 0.25rem 0.65rem; border-radius: 6px; font-weight: 600; font-size: 0.78rem;">🟢 Normal / No Heat</span>`;
+
+          const feedMin = Math.floor(cs.feeding_duration_sec / 60);
+          const feedSec = Math.round(cs.feeding_duration_sec % 60);
+          const restMin = Math.floor(cs.resting_duration_sec / 60);
+          const restSec = Math.round(cs.resting_duration_sec % 60);
+
+          card.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.7rem;">
+              <div style="font-weight: 700; font-size: 1.05rem; color: #fff;">📹 Camera: ${cs.camera_id}</div>
+              <div>${estrusBadge}</div>
+            </div>
+            <div style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.6rem;">
+              Herd Count Today: <b style="color: #00e59b;">${cs.unique_cattle_count} Unique Cattle</b> (Deduplicated)
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.84rem;">
+              <div>🍽️ <b>Feeding Duration:</b> <span style="color:#00b0ff; font-weight:600;">${feedMin}m ${feedSec}s</span></div>
+              <div>💤 <b>Resting Duration:</b> <span style="color:#b388ff; font-weight:600;">${restMin}m ${restSec}s</span></div>
+              <div>👷 <b>Workers Logged:</b> <span style="color:#ff9100; font-weight:600;">${cs.workers_count} Worker(s)</span></div>
+            </div>
+          `;
+          summaryContainer.appendChild(card);
+        });
+      }
+
+      if (!cattleRegistry || cattleRegistry.length === 0) {
+        rosterContainer.innerHTML = `
+          <div style="color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem;">
+            No cattle logged today yet.
+          </div>
+        `;
+      } else {
+        cattleRegistry.forEach(c => {
+          const item = document.createElement("div");
+          item.style = "min-width: 210px; max-width: 230px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 0.8rem; flex-shrink: 0;";
+          
+          const disColor = (c.disease_status === 'Healthy' || !c.disease_status) ? '#00e59b' : '#ff5252';
+          const heatBadge = c.has_estrus ? 
+            `<span style="background: rgba(255, 68, 68, 0.2); color: #ff5252; font-size: 0.68rem; font-weight: 700; padding: 0.1rem 0.4rem; border-radius: 4px;">🔥 Estrus Sign</span>` : 
+            `<span style="background: rgba(255, 255, 255, 0.08); color: var(--text-muted); font-size: 0.68rem; padding: 0.1rem 0.4rem; border-radius: 4px;">Normal</span>`;
+
+          const feedSec = Math.round(c.total_eating_sec || 0);
+          const restSec = Math.round(c.total_resting_sec || 0);
+
+          item.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem;">
+              <b style="color: #00e59b; font-family: var(--font-mono); font-size: 0.95rem;">${c.cattle_id}</b>
+              ${heatBadge}
+            </div>
+            <div style="font-size: 0.82rem; color: #fff; margin-bottom: 0.2rem;">🐄 Breed: <b>${c.breed}</b></div>
+            <div style="font-size: 0.78rem; color: ${disColor}; margin-bottom: 0.25rem;">🩺 ${c.disease_status}</div>
+            <div style="font-size: 0.74rem; color: var(--text-muted); margin-bottom: 0.35rem;">
+              BCS: ${c.bcs_score} | ${Math.round(c.estimated_weight_kg)}kg | ${Math.round(c.estimated_height_cm)}cm
+            </div>
+            <div style="font-size: 0.74rem; color: #8ab4f8; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 0.35rem;">
+              🍽️ Eat: ${Math.floor(feedSec / 60)}m ${feedSec % 60}s | 💤 Rest: ${Math.floor(restSec / 60)}m ${restSec % 60}s
+            </div>
+          `;
+          rosterContainer.appendChild(item);
+        });
       }
     }
 

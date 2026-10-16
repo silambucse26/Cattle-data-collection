@@ -369,24 +369,32 @@ class ActivityEngine:
         now_dt = (video_base_dt + datetime.timedelta(seconds=video_seconds)) if (video_base_dt and self.video_source_type == "uploaded") else datetime.datetime.now(datetime.timezone.utc)
 
         # 1. Estrus / Mounting Activity (Requires genuine 2+ cattle mounting kinematics)
+        active_estrus_cow_ids = set()
         for ev in estrus_events:
             mounting_id = ev.get("mounting_id")
             mounted_id = ev.get("mounted_id")
             conf = ev.get("conf", 0.90)
-            behavior = ev.get("behavior", "Active Mounting / Standing Heat")
+            behavior = ev.get("behavior", "Standing Heat / Chin Resting")
+            active_estrus_cow_ids.add(mounting_id)
+            active_estrus_cow_ids.add(mounted_id)
+            c_m_tag = f"COW{mounting_id:03d}" if isinstance(mounting_id, int) else str(mounting_id)
+            c_f_tag = f"COW{mounted_id:03d}" if isinstance(mounted_id, int) else str(mounted_id)
+            active_estrus_cow_ids.add(c_m_tag)
+            active_estrus_cow_ids.add(c_f_tag)
+
             self.trigger_activity(
                 activity_type="estrus_detected",
                 confidence=conf,
-                description=f"Detected Estrus Sign: Cattle #{mounting_id} actively mounting Cattle #{mounted_id} ({behavior})",
+                description=f"Detected Estrus Sign: Cattle #{mounting_id} & Cattle #{mounted_id} ({behavior})",
                 current_frame=frame,
-                cattle_id=f"COW{mounting_id:03d}" if isinstance(mounting_id, int) else str(mounting_id),
+                cattle_id=c_m_tag,
                 ai_detection_result={
                     "behavior": behavior,
                     "mounting_cattle_id": mounting_id,
                     "mounted_cattle_id": mounted_id,
                     "model": "Kinematic Mounting Detector + CowXNet"
                 },
-                status="detected_sign",
+                status="verified",
                 current_ts=now_ts,
                 current_dt=now_dt,
                 record_video_clip=True
@@ -472,10 +480,18 @@ class ActivityEngine:
             herd_count = len(cattle_tracks)
             weight_kg = c.get("weight_kg", 400.0)
             height_cm = c.get("height_cm", 130.0)
+            feed_sess_key = f"{cow_tag}_feeding_activity"
 
-            # Feeding detection criteria: head down near ground/manger with feed-reach posture
-            is_near_ground_or_manger = y2 > int(h_frame * 0.52)
-            is_feeding_posture = is_near_ground_or_manger and aspect_ratio >= 1.10
+            # If cow is engaged in active estrus / standing heat interaction, suppress false feeding
+            if cid in active_estrus_cow_ids or cow_tag in active_estrus_cow_ids:
+                hist["head_down_frames"] = 0
+                if feed_sess_key in self.active_cattle_sessions:
+                    del self.active_cattle_sessions[feed_sess_key]
+                continue
+
+            # Feeding detection criteria: head down near ground/feed trough with grazing posture
+            is_near_ground = y2 > int(h_frame * 0.62)
+            is_feeding_posture = is_near_ground and (aspect_ratio >= 1.25) and not is_resting_posture
 
             if is_feeding_posture:
                 hist["head_down_frames"] += 1
@@ -484,8 +500,7 @@ class ActivityEngine:
                 hist["head_down_frames"] = max(0, hist["head_down_frames"] - 1)
 
             # Continuous Feeding Session (Zero Duplicates, Live Duration Tracking, NO video clip spam)
-            feed_sess_key = f"{cow_tag}_feeding_activity"
-            if hist["head_down_frames"] >= 15:
+            if hist["head_down_frames"] >= 25:
                 if feed_sess_key not in self.active_cattle_sessions:
                     # Start NEW continuous feeding session
                     act_id = str(uuid.uuid4())
