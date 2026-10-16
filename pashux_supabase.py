@@ -540,7 +540,6 @@ class SupabaseManager:
                             q2 = self.client.table("farm_activities").update(fallback_updates).eq("activity_id", activity_id)
                             if farm_id:
                                 q2 = q2.eq("farm_id", farm_id)
-                            q2.execute()
                     else:
                         raise ex
                 return True
@@ -548,6 +547,113 @@ class SupabaseManager:
                 print(f"[Supabase DB Update Error] {e}")
                 return False
         return True
+
+    def delete_activity(self, farm_id: Optional[str], activity_id: str) -> bool:
+        """Deletes an activity record from Supabase and local cache."""
+        try:
+            if LOCAL_DB_FILE.exists():
+                with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+                records = [r for r in records if str(r.get("activity_id")) != str(activity_id)]
+                with open(LOCAL_DB_FILE, "w", encoding="utf-8") as f:
+                    json.dump(records, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[Supabase delete local error] {e}")
+
+        if self.is_connected and self.client:
+            try:
+                q = self.client.table("farm_activities").delete().eq("activity_id", activity_id)
+                if farm_id:
+                    q = q.eq("farm_id", farm_id)
+                q.execute()
+                return True
+            except Exception as e:
+                print(f"[Supabase delete remote error] {e}")
+                return False
+        return True
+
+    def clean_duplicate_activities(self, farm_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Consolidates duplicate records for the same cattle/activity within cooldown windows,
+        and eliminates spurious false estrus records caused by generic cow detections.
+        """
+        farm_id = farm_id or DEFAULT_FARM_ID
+        deleted_count = 0
+        deleted_ids = []
+
+        try:
+            if LOCAL_DB_FILE.exists():
+                with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+
+                cleaned = []
+                seen_estrus_ts = 0.0
+                seen_sessions = set()
+
+                for r in records:
+                    act_type = str(r.get("activity_type", ""))
+                    desc = str(r.get("description", ""))
+                    ai_res = r.get("ai_detection_result") or {}
+                    aid = str(r.get("activity_id"))
+
+                    # Eliminate false estrus (e.g. single grazing cow classified as 'cow' mounting another)
+                    if "estrus" in act_type and (ai_res.get("behavior") == "cow" or "(cow)" in desc):
+                        deleted_ids.append(aid)
+                        continue
+
+                    # Rate-limit estrus events so at most 1 event per 5 minutes exists
+                    if "estrus" in act_type:
+                        try:
+                            created_ts = datetime.datetime.fromisoformat(r.get("created_at", "").replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            created_ts = 0.0
+                        if abs(created_ts - seen_estrus_ts) < 300.0 and seen_estrus_ts > 0:
+                            deleted_ids.append(aid)
+                            continue
+                        seen_estrus_ts = created_ts
+
+                    # Consolidate duplicate feeding/resting sessions for same cattle & date
+                    if "feeding" in act_type or "resting" in act_type:
+                        cid = str(r.get("cattle_id", ""))
+                        date_str = str(r.get("detection_date", ""))
+                        sess_key = f"{cid}_{act_type}_{date_str}"
+                        if sess_key in seen_sessions:
+                            prev_item = next((item for item in cleaned if f"{item.get('cattle_id')}_{item.get('activity_type')}_{item.get('detection_date')}" == sess_key), None)
+                            if prev_item:
+                                prev_dur = float(prev_item.get("activity_duration") or 0.0)
+                                cur_dur = float(r.get("activity_duration") or 0.0)
+                                if cur_dur > prev_dur:
+                                    cleaned.remove(prev_item)
+                                    deleted_ids.append(str(prev_item.get("activity_id")))
+                                    cleaned.append(r)
+                                else:
+                                    deleted_ids.append(aid)
+                            else:
+                                deleted_ids.append(aid)
+                            continue
+                        seen_sessions.add(sess_key)
+
+                    cleaned.append(r)
+
+                with open(LOCAL_DB_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cleaned, f, indent=2, default=str)
+                deleted_count = len(deleted_ids)
+        except Exception as e:
+            print(f"[Clean Duplicates Local Error] {e}")
+
+        if self.is_connected and self.client and deleted_ids:
+            try:
+                for chunk_idx in range(0, len(deleted_ids), 30):
+                    chunk = deleted_ids[chunk_idx:chunk_idx + 30]
+                    self.client.table("farm_activities").delete().in_("activity_id", chunk).execute()
+            except Exception as e:
+                print(f"[Clean Duplicates Supabase Error] {e}")
+
+        return {
+            "success": True,
+            "deleted_count": deleted_count,
+            "message": f"Deduplication complete: cleaned {deleted_count} duplicate and false entries."
+        }
 
     def _save_to_local_cache(self, activity_data: Dict[str, Any]):
         """Appends activity record to local JSON file for persistence."""

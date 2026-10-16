@@ -299,6 +299,48 @@ def start_monitoring_worker(source_path: str, source_type: str, farm_id: str, ca
     t.start()
 
 
+def check_cattle_mounting(c1: Dict[str, Any], c2: Dict[str, Any]) -> Tuple[bool, float]:
+    """
+    Evaluates kinematic criteria for genuine mounting / estrus behavior:
+    1. Substantial 2D overlap between cattle bodies
+    2. Mounting cow is reared up (top is elevated, center is higher, lower body overlaps mounted cow)
+    """
+    box1, box2 = c1.get("box", [0, 0, 0, 0]), c2.get("box", [0, 0, 0, 0])
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+
+    w1, h1 = max(1, x2_1 - x1_1), max(1, y2_1 - y1_1)
+    w2, h2 = max(1, x2_2 - x1_2), max(1, y2_2 - y1_2)
+
+    if min(w1, h1, w2, h2) < 40:
+        return False, 0.0
+
+    inter_x = max(0, min(x2_1, x2_2) - max(x1_1, x1_2))
+    inter_y = max(0, min(y2_1, y2_2) - max(y1_1, y1_2))
+    inter_area = inter_x * inter_y
+    if inter_area <= 0:
+        return False, 0.0
+
+    min_area = min(w1 * h1, w2 * h2)
+    iomin = inter_area / float(min_area)
+
+    cx1, cy1 = (x1_1 + x2_1) / 2.0, (y1_1 + y2_1) / 2.0
+    cx2, cy2 = (x1_2 + x2_2) / 2.0, (y1_2 + y2_2) / 2.0
+
+    # Horizontal center alignment check
+    if abs(cx1 - cx2) > max(w1, w2) * 0.65:
+        return False, 0.0
+
+    # Cow 1 mounting Cow 2:
+    # Top is significantly higher, center is higher, bottom overlaps mounted cow
+    elevation_diff = y1_2 - y1_1
+    if (iomin >= 0.35) and (elevation_diff >= min(h1, h2) * 0.25) and (cy1 < cy2) and (y2_1 > y1_2 + min(h1, h2) * 0.20):
+        conf = min(0.96, max(0.85, 0.78 + (iomin * 0.18)))
+        return True, conf
+
+    return False, 0.0
+
+
 def ai_video_monitoring_loop(
     source_path: str,
     source_type: str,
@@ -337,7 +379,7 @@ def ai_video_monitoring_loop(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if source_type == "uploaded" else 0
 
     # Initialize Spatial Cattle Tracker with Profile Cache
-    cattle_tracker = SpatialCattleTracker(iou_threshold=0.35, max_missing_frames=30)
+    cattle_tracker = SpatialCattleTracker(iou_threshold=0.25, max_missing_frames=30)
 
     # Initialize Activity Engine (10-second clip capture: 4s pre + 6s post)
     engine = ActivityEngine(
@@ -354,6 +396,9 @@ def ai_video_monitoring_loop(
     stride = 2 if source_type == "uploaded" else 1
     cattle_tracks: List[Dict[str, Any]] = []
     human_tracks: List[Dict[str, Any]] = []
+    video_base_dt = datetime.datetime.now(datetime.timezone.utc)
+    mounting_streaks: Dict[Tuple[int, int], int] = {}
+    video_sec = 0.0
     loop_start_time = time.time()
 
     try:
@@ -498,20 +543,32 @@ def ai_video_monitoring_loop(
                 cattle_tracks = cur_cattle
                 human_tracks = cur_humans
 
-                # 5. Estrus Detection (Selective: when 2+ cattle are present)
+                video_sec = round(float(frame_count) / max(1.0, fps), 2)
+
+                # 5. Genuine Kinematic Mounting & Estrus Detection (Requires 2+ distinct cattle with physical mounting posture)
                 estrus_events = []
-                if ai_models.has_model("estrus") and len(cattle_tracks) >= 2:
-                    t_est0 = time.time()
-                    est_preds = ai_models.run_estrus(frame, conf=0.30)
-                    telemetry_profiler.record_inference("estrus", time.time() - t_est0)
-                    if est_preds:
-                        for ep in est_preds:
-                            estrus_events.append({
-                                "mounting_id": cattle_tracks[0]["id"],
-                                "mounted_id": cattle_tracks[1]["id"],
-                                "conf": ep.get("conf", 0.88),
-                                "behavior": ep.get("label", "Standing Heat / Mounting")
-                            })
+                if len(cattle_tracks) >= 2:
+                    for i in range(len(cattle_tracks)):
+                        for j in range(len(cattle_tracks)):
+                            if i == j:
+                                continue
+                            c_m = cattle_tracks[i]
+                            c_f = cattle_tracks[j]
+                            is_mount, m_conf = check_cattle_mounting(c_m, c_f)
+                            pair_key = (c_m["id"], c_f["id"])
+                            if is_mount:
+                                mounting_streaks[pair_key] = mounting_streaks.get(pair_key, 0) + 1
+                                # Confirmed mounting after at least 12 consecutive frames (~0.8s)
+                                if mounting_streaks[pair_key] >= 12:
+                                    estrus_events.append({
+                                        "mounting_id": c_m["id"],
+                                        "mounted_id": c_f["id"],
+                                        "conf": round(m_conf, 2),
+                                        "behavior": "Active Mounting / Standing Heat"
+                                    })
+                            else:
+                                if pair_key in mounting_streaks:
+                                    mounting_streaks[pair_key] = max(0, mounting_streaks[pair_key] - 1)
 
                 # 6. Process Activity Recognition (Feeding, Resting, Worker Attendance, 10s Video Clips)
                 engine.process_frame_activities(
@@ -519,7 +576,9 @@ def ai_video_monitoring_loop(
                     cattle_tracks=cattle_tracks,
                     human_tracks=human_tracks,
                     estrus_events=estrus_events,
-                    frame_idx=frame_count
+                    frame_idx=frame_count,
+                    video_seconds=video_sec,
+                    video_base_dt=video_base_dt
                 )
 
                 # Record Profiler Step
@@ -564,6 +623,12 @@ def ai_video_monitoring_loop(
             if source_type == "uploaded":
                 time.sleep(0.005)
 
+        # Finalize all open feeding, resting, and worker sessions before completing
+        try:
+            engine.finalize_all_sessions(current_video_sec=video_sec, video_base_dt=video_base_dt)
+        except Exception as e:
+            print(f"[PashuX AI] Session finalization notice: {e}")
+
         # Successful completion
         total_time = max(0.1, time.time() - loop_start_time)
         final_fps = round(frame_count / total_time, 2)
@@ -579,6 +644,10 @@ def ai_video_monitoring_loop(
 
     finally:
         cap.release()
+        try:
+            engine.finalize_all_sessions(current_video_sec=video_sec, video_base_dt=video_base_dt)
+        except Exception:
+            pass
         time.sleep(2.0)  # Allow background video encoding worker to complete active 10s clips
         active_monitoring_state["is_running"] = False
         active_monitoring_state["status_text"] = f"Finished ({frame_count} frames processed & uploaded)"
@@ -1565,17 +1634,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const entityLabel = item.cattle_id ? `#${item.cattle_id}` : (item.worker_id ? `#${item.worker_id}` : "Herd");
         const formattedDate = new Date(item.start_time || item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + (item.detection_date || '');
 
+        const hasVideo = item.captured_video_storage_path && item.captured_video_storage_path.trim() !== "";
+        let mediaTag = "";
         let durationHtml = "";
+
+        const startTimeStr = item.start_time ? new Date(item.start_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : "";
+        const endTimeStr = item.end_time ? new Date(item.end_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : "";
+        const timeRangeStr = (startTimeStr && endTimeStr && startTimeStr !== endTimeStr) ? ` (${startTimeStr} - ${endTimeStr})` : (startTimeStr ? ` (Started: ${startTimeStr})` : '');
+
         if (item.activity_type.includes("feeding")) {
           const eatingSec = Math.round(item.eating_duration_sec || item.activity_duration || 0);
           const eMin = Math.floor(eatingSec / 60);
           const eSec = eatingSec % 60;
-          durationHtml = `<div style="color: #00b0ff; font-weight: 700; font-size: 0.82rem; margin-top: 0.2rem;">🍽️ Eating Duration: ${eMin}m ${eSec}s</div>`;
+          mediaTag = `<div class="video-tag" style="background: rgba(0, 176, 255, 0.25); color: #00b0ff; border-color: rgba(0, 176, 255, 0.4);">🍽️ ${eMin}m ${eSec}s Session</div>`;
+          durationHtml = `<div style="color: #00b0ff; font-weight: 700; font-size: 0.82rem; margin-top: 0.2rem;">🍽️ Eating Duration: ${eMin}m ${eSec}s <span style="font-weight:400; color:#8ab4f8; font-size:0.75rem;">${timeRangeStr}</span></div>`;
         } else if (item.activity_type.includes("resting")) {
           const restSec = Math.round(item.resting_duration_sec || item.activity_duration || 0);
           const rMin = Math.floor(restSec / 60);
           const rSec = restSec % 60;
-          durationHtml = `<div style="color: #b388ff; font-weight: 700; font-size: 0.82rem; margin-top: 0.2rem;">💤 Resting Duration: ${rMin}m ${rSec}s</div>`;
+          mediaTag = `<div class="video-tag" style="background: rgba(179, 136, 255, 0.25); color: #b388ff; border-color: rgba(179, 136, 255, 0.4);">💤 ${rMin}m ${rSec}s Session</div>`;
+          durationHtml = `<div style="color: #b388ff; font-weight: 700; font-size: 0.82rem; margin-top: 0.2rem;">💤 Resting Duration: ${rMin}m ${rSec}s <span style="font-weight:400; color:#d1c4e9; font-size:0.75rem;">${timeRangeStr}</span></div>`;
+        } else if (hasVideo) {
+          mediaTag = `<div class="video-tag">▶ 10s Clip</div>`;
+        } else {
+          mediaTag = `<div class="video-tag" style="background: rgba(255, 255, 255, 0.15); color: #fff;">📸 Snapshot</div>`;
         }
 
         const breedBadge = `<span style="background: rgba(255,255,255,0.08); padding: 0.15rem 0.45rem; border-radius: 4px; font-size: 0.72rem;">🐄 ${item.breed || 'Cattle'}</span>`;
@@ -1589,7 +1671,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="card-media">
             <img class="card-thumb" src="${item.image_url || '/media/images/placeholder.jpg'}" alt="${item.activity_type}">
             <span class="badge-status ${badge.class}">${badge.label}</span>
-            <div class="video-tag">▶ 10s Clip</div>
+            ${mediaTag}
           </div>
           <div class="card-body">
             <div class="card-top">

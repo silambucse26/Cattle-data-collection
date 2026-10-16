@@ -109,7 +109,7 @@ class CattleProfileCache:
 
 class SpatialCattleTracker:
     """Associates bounding box detections across consecutive frames to maintain consistent cattle IDs."""
-    def __init__(self, iou_threshold: float = 0.35, max_missing_frames: int = 30):
+    def __init__(self, iou_threshold: float = 0.25, max_missing_frames: int = 30):
         self.iou_threshold = iou_threshold
         self.max_missing_frames = max_missing_frames
         self.next_id = 1
@@ -124,20 +124,54 @@ class SpatialCattleTracker:
     def update(self, detected_boxes: List[List[int]], confidences: Optional[List[float]] = None) -> List[Dict[str, Any]]:
         """
         Takes raw detected boxes [[x1, y1, x2, y2], ...] and optional confidences.
-        Returns associated tracks [{'id': int, 'box': [x1,y1,x2,y2], 'conf': float}]
+        Suppresses redundant overlapping sub-boxes and associates tracks via IoU & centroid distance.
         """
+        if not detected_boxes:
+            # Increment missing count for unassociated tracks and prune old ones
+            to_delete = []
+            for tid, track in self.tracks.items():
+                track["missing_frames"] += 1
+                if track["missing_frames"] > self.max_missing_frames:
+                    to_delete.append(tid)
+            for tid in to_delete:
+                del self.tracks[tid]
+            return []
+
+        # Non-Maximum / duplicate box suppression for cattle detections
+        filtered_boxes = []
+        filtered_confs = []
+        indices = list(range(len(detected_boxes)))
+        if confidences:
+            indices.sort(key=lambda i: confidences[i], reverse=True)
+
+        for i in indices:
+            box_i = detected_boxes[i]
+            conf_i = confidences[i] if (confidences and i < len(confidences)) else 0.90
+            keep = True
+            for fbox in filtered_boxes:
+                # If high IoU or one box is mostly inside another, suppress duplicate
+                if compute_iou(box_i, fbox) > 0.60:
+                    keep = False
+                    break
+            if keep:
+                filtered_boxes.append(box_i)
+                filtered_confs.append(conf_i)
+
+        detected_boxes = filtered_boxes
+        confidences = filtered_confs
+
         matched_tracks = []
         unmatched_dets = list(range(len(detected_boxes)))
         existing_track_ids = list(self.tracks.keys())
 
-        # Match detection boxes to existing tracks by maximum IoU
+        # Step 1: Match detection boxes to existing tracks by maximum IoU
         if existing_track_ids and detected_boxes:
             iou_matrix = np.zeros((len(existing_track_ids), len(detected_boxes)), dtype=np.float32)
             for i, tid in enumerate(existing_track_ids):
                 for j, dbox in enumerate(detected_boxes):
                     iou_matrix[i, j] = compute_iou(self.tracks[tid]["box"], dbox)
 
-            # Greedy assignment
+            # Greedy assignment for IoU >= threshold
             for _ in range(min(len(existing_track_ids), len(detected_boxes))):
                 max_val = np.max(iou_matrix)
                 if max_val < self.iou_threshold:
@@ -147,20 +181,51 @@ class SpatialCattleTracker:
                 dbox = detected_boxes[col]
                 conf = confidences[col] if (confidences and col < len(confidences)) else 0.90
 
-                # Update track
                 self.tracks[tid]["box"] = dbox
                 self.tracks[tid]["conf"] = conf
                 self.tracks[tid]["missing_frames"] = 0
+                self.tracks[tid]["hits"] = self.tracks[tid].get("hits", 1) + 1
                 self.tracks[tid]["last_seen"] = time.time()
                 matched_tracks.append({"id": tid, "box": dbox, "conf": conf})
 
                 if col in unmatched_dets:
                     unmatched_dets.remove(col)
-                # Invalidate matched row and col
                 iou_matrix[row, :] = -1.0
                 iou_matrix[:, col] = -1.0
 
-        # Create new tracks for unmatched detections
+        # Step 2: Centroid distance matching for remaining unmatched detections (handles sudden posture shifts like grazing)
+        if unmatched_dets:
+            unmatched_existing = [tid for tid in existing_track_ids if not any(m["id"] == tid for m in matched_tracks)]
+            for tid in unmatched_existing:
+                tbox = self.tracks[tid]["box"]
+                tcx = (tbox[0] + tbox[2]) / 2.0
+                tcy = (tbox[1] + tbox[3]) / 2.0
+                diag = math.sqrt((tbox[2] - tbox[0]) ** 2 + (tbox[3] - tbox[1]) ** 2)
+                max_dist = max(80.0, diag * 0.70)
+
+                best_det = None
+                best_dist = float("inf")
+                for d_idx in unmatched_dets:
+                    dbox = detected_boxes[d_idx]
+                    dcx = (dbox[0] + dbox[2]) / 2.0
+                    dcy = (dbox[1] + dbox[3]) / 2.0
+                    dist = math.sqrt((tcx - dcx) ** 2 + (tcy - dcy) ** 2)
+                    if dist < max_dist and dist < best_dist:
+                        best_dist = dist
+                        best_det = d_idx
+
+                if best_det is not None:
+                    dbox = detected_boxes[best_det]
+                    conf = confidences[best_det] if (confidences and best_det < len(confidences)) else 0.90
+                    self.tracks[tid]["box"] = dbox
+                    self.tracks[tid]["conf"] = conf
+                    self.tracks[tid]["missing_frames"] = 0
+                    self.tracks[tid]["hits"] = self.tracks[tid].get("hits", 1) + 1
+                    self.tracks[tid]["last_seen"] = time.time()
+                    matched_tracks.append({"id": tid, "box": dbox, "conf": conf})
+                    unmatched_dets.remove(best_det)
+
+        # Step 3: Create new tracks for remaining unmatched detections
         for det_idx in unmatched_dets:
             new_id = self.next_id
             self.next_id += 1
@@ -170,12 +235,13 @@ class SpatialCattleTracker:
                 "box": dbox,
                 "conf": conf,
                 "missing_frames": 0,
+                "hits": 1,
                 "first_seen": time.time(),
                 "last_seen": time.time()
             }
             matched_tracks.append({"id": new_id, "box": dbox, "conf": conf})
 
-        # Increment missing count for unassociated tracks and prune old ones
+        # Step 4: Increment missing count for unassociated tracks and prune old ones
         to_delete = []
         for tid, track in self.tracks.items():
             if not any(m["id"] == tid for m in matched_tracks):

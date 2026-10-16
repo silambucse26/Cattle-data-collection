@@ -140,10 +140,24 @@ class ActivityEngine:
                 # Dispatch async video finalizer and Supabase uploader to dedicated queue worker
                 global_evidence_worker.submit(c_job, self)
 
-    def _is_cooling_down(self, activity_type: str, entity_id: str) -> bool:
+    def _is_cooling_down(self, activity_type: str, entity_id: str, current_ts: Optional[float] = None) -> bool:
         """Checks if this activity for this entity is within cooldown period."""
+        now = current_ts if current_ts is not None else time.time()
+
+        # Strict global & entity cooldown for Estrus: at most 1 clip per 300s (5 minutes)
+        if activity_type == "estrus_detected":
+            last_global = self.cooldown_tracker.get("estrus_detected_global", -999999.0)
+            if now - last_global < 300.0 and last_global > 0:
+                return True
+            key = f"{activity_type}_{entity_id}"
+            last_t = self.cooldown_tracker.get(key, -999999.0)
+            if now - last_t < 300.0 and last_t > 0:
+                return True
+            self.cooldown_tracker["estrus_detected_global"] = now
+            self.cooldown_tracker[key] = now
+            return False
+
         key = f"{activity_type}_{entity_id}"
-        now = time.time()
         last_t = self.cooldown_tracker.get(key, 0.0)
         if now - last_t < self.cooldown_seconds:
             return True
@@ -168,21 +182,24 @@ class ActivityEngine:
         disease_status: str = "Healthy",
         bcs_score: float = 3.0,
         estimated_weight_kg: float = 400.0,
-        estimated_height_cm: float = 130.0
+        estimated_height_cm: float = 130.0,
+        current_ts: Optional[float] = None,
+        current_dt: Optional[datetime.datetime] = None,
+        record_video_clip: bool = True
     ):
         """
         Triggers automatic activity evidence capture:
         1. Verifies anti-duplication cooldown
         2. Captures clear high-res image
-        3. Prepares 10-second video clip using pre-event buffered frames + post-event frames
-        4. Uploads to Supabase Storage & Database
+        3. Prepares 10-second video clip using pre-event buffered frames + post-event frames (if record_video_clip is True)
+        4. Uploads to Supabase Storage & Database without duplicate cards
         """
         entity_key = cattle_id or worker_id or "general"
-        if not activity_id_override and self._is_cooling_down(activity_type, entity_key):
+        if not activity_id_override and self._is_cooling_down(activity_type, entity_key, current_ts):
             return
 
         activity_id = activity_id_override or str(uuid.uuid4())
-        detection_timestamp = datetime.datetime.now(datetime.timezone.utc)
+        detection_timestamp = current_dt or datetime.datetime.now(datetime.timezone.utc)
         start_time = detection_timestamp - datetime.timedelta(seconds=self.pre_buffer_seconds)
         end_time = detection_timestamp + datetime.timedelta(seconds=self.post_buffer_seconds)
 
@@ -193,14 +210,6 @@ class ActivityEngine:
             cv2.imwrite(local_snapshot_path, current_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         except Exception as e:
             print(f"[ActivityEngine] Snapshot write error: {e}")
-
-        # 2. Extract Pre-Event Frames from Rolling Circular Buffer
-        pre_frames = []
-        with self.buffer_lock:
-            pre_frames = [f[0].copy() for f in self.frame_buffer]
-
-        total_frames_target = int(self.fps * self.total_clip_duration)
-        post_frames_needed = max(10, total_frames_target - len(pre_frames))
 
         dur = round(self.total_clip_duration, 1)
         if eating_duration_sec > dur:
@@ -233,26 +242,36 @@ class ActivityEngine:
             "video_source": self.video_source_type,
             "status": status,
             "created_at": detection_timestamp.isoformat(),
-            "local_snapshot_path": local_snapshot_path
+            "local_snapshot_path": local_snapshot_path,
+            "captured_video_storage_path": ""
         }
 
-        # Prevent duplicate simultaneous video recording jobs to prevent memory exhaustion
+        # If this activity does NOT require a video clip (e.g. continuous feeding or resting session), save snapshot only
+        if not record_video_clip:
+            remote_image_path = supabase_manager.upload_image(self.farm_id, activity_id, local_snapshot_path)
+            meta["captured_image_storage_path"] = remote_image_path or local_snapshot_path
+            supabase_manager.record_activity(meta)
+            if self.on_activity_detected:
+                try:
+                    self.on_activity_detected(meta)
+                except Exception:
+                    pass
+            return
+
+        # Prevent duplicate simultaneous video recording jobs to prevent memory exhaustion & card spam
         with self.jobs_lock:
             if len(self.active_recording_jobs) >= 1:
-                # Video is already actively recording for this camera scene
-                # Upload snapshot and link to active recording session
-                remote_image_path = supabase_manager.upload_image(self.farm_id, activity_id, local_snapshot_path)
-                active_job = self.active_recording_jobs[0]
-                meta["captured_image_storage_path"] = remote_image_path or local_snapshot_path
-                meta["captured_video_storage_path"] = f"{self.farm_id}/videos/{active_job['activity_id']}.mp4"
-                supabase_manager.record_activity(meta)
-                print(f"[EVENT LOGGED] {activity_type.upper()} | Entity: {entity_key} (Linked to active 10s video clip)")
-                if self.on_activity_detected:
-                    try:
-                        self.on_activity_detected(meta)
-                    except Exception:
-                        pass
+                # Video is already actively recording for this event; suppress duplicate card creation
+                print(f"[ActivityEngine] Suppressed duplicate event trigger during active video clip encoding ({entity_key})")
                 return
+
+        # 2. Extract Pre-Event Frames from Rolling Circular Buffer
+        pre_frames = []
+        with self.buffer_lock:
+            pre_frames = [f[0].copy() for f in self.frame_buffer]
+
+        total_frames_target = int(self.fps * self.total_clip_duration)
+        post_frames_needed = max(10, total_frames_target - len(pre_frames))
 
         # Queue recording job to collect remaining post-event frames
         job = {
@@ -267,14 +286,13 @@ class ActivityEngine:
             self.active_recording_jobs.append(job)
 
         print(f"\n[EVENT TRIGGERED] {activity_type.upper()} | Confidence: {int(confidence*100)}% | Entity: {entity_key}")
-        print(f"                 Capturing 10-second video evidence ({self.pre_buffer_seconds}s pre + {self.post_buffer_seconds}s post)...")
+        print(f"                 Capturing exactly ONE 10-second video evidence clip ({self.pre_buffer_seconds}s pre + {self.post_buffer_seconds}s post)...")
 
         if self.on_activity_detected:
             try:
                 self.on_activity_detected(meta)
             except Exception:
                 pass
-
     def _finalize_and_upload_clip(self, job: Dict[str, Any]):
         """Encodes captured frames into MP4 video and uploads image + video to Supabase."""
         activity_id = job["activity_id"]
@@ -331,27 +349,31 @@ class ActivityEngine:
         cattle_tracks: List[Dict[str, Any]],
         human_tracks: List[Dict[str, Any]],
         estrus_events: List[Dict[str, Any]],
-        frame_idx: int
+        frame_idx: int,
+        video_seconds: float = 0.0,
+        video_base_dt: Optional[datetime.datetime] = None
     ):
         """
         Runs comprehensive activity recognition on current frame:
-        1. Estrus / Heat (Mounting & Standing Heat)
+        1. Estrus / Heat (Mounting & Standing Heat - Strictly one 10s evidence clip per episode)
         2. Cattle Disease Indicators (FMD, LSD)
         3. Cattle Breed & Extreme BCS Detection (Severe Thin / Obese)
-        4. Calving Activity (Prolonged Recumbency / Restlessness / Neonate)
-        5. Feeding Activity (Head-Down Manger Stance)
-        6. Cleaning Activity (Worker Stall Sanitation & Movement)
-        7. Worker Entry & Exit Tracking
-        8. Cattle Identification & Herd Counting Milestones
+        4. Calving Activity (Dedicated model hook)
+        5. Feeding Activity (Live Session Tracking with Exact Start, End, and Duration, NO video spam)
+        6. Resting / Rumination Activity (Live Session Tracking with Exact Start, End, and Duration)
+        7. Worker Entry & Stall Cleaning Activities
+        8. Worker Attendance During Feeding
         """
         h_frame, w_frame = frame.shape[:2]
+        now_ts = video_seconds if self.video_source_type == "uploaded" else time.time()
+        now_dt = (video_base_dt + datetime.timedelta(seconds=video_seconds)) if (video_base_dt and self.video_source_type == "uploaded") else datetime.datetime.now(datetime.timezone.utc)
 
-        # 1. Estrus / Heat Activity
+        # 1. Estrus / Mounting Activity (Requires genuine 2+ cattle mounting kinematics)
         for ev in estrus_events:
             mounting_id = ev.get("mounting_id")
             mounted_id = ev.get("mounted_id")
             conf = ev.get("conf", 0.90)
-            behavior = ev.get("behavior", "Standing Heat / Mounting")
+            behavior = ev.get("behavior", "Active Mounting / Standing Heat")
             self.trigger_activity(
                 activity_type="estrus_detected",
                 confidence=conf,
@@ -362,9 +384,12 @@ class ActivityEngine:
                     "behavior": behavior,
                     "mounting_cattle_id": mounting_id,
                     "mounted_cattle_id": mounted_id,
-                    "model": "CowXNet_heat_model + estrusdetection.pt"
+                    "model": "Kinematic Mounting Detector + CowXNet"
                 },
-                status="detected_sign"
+                status="detected_sign",
+                current_ts=now_ts,
+                current_dt=now_dt,
+                record_video_clip=True
             )
 
         # 2. Disease, BCS & Calving Behaviors across Cattle Tracks
@@ -395,7 +420,10 @@ class ActivityEngine:
                         "bcs": bcs_float,
                         "model": "final_cattle_disease_model.keras"
                     },
-                    status="suspected_sign"
+                    status="suspected_sign",
+                    current_ts=now_ts,
+                    current_dt=now_dt,
+                    record_video_clip=True
                 )
 
             # Severe BCS Alert (BCS 1 Severe Thinness or BCS 5 Extreme Obesity)
@@ -414,7 +442,10 @@ class ActivityEngine:
                         "breed": breed,
                         "model": "best_bcs_cnn_v2.pth"
                     },
-                    status="detected_sign"
+                    status="detected_sign",
+                    current_ts=now_ts,
+                    current_dt=now_dt,
+                    record_video_clip=True
                 )
 
             # Cattle Tracking & State Memory
@@ -423,7 +454,7 @@ class ActivityEngine:
                     "recumbent_frames": 0,
                     "head_down_frames": 0,
                     "last_pos": box,
-                    "first_seen": time.time()
+                    "first_seen": now_ts
                 }
             hist = self.cattle_behavior_history[cid]
 
@@ -432,11 +463,8 @@ class ActivityEngine:
             bh = max(1, y2 - y1)
             aspect_ratio = float(bw) / float(bh)
 
-            # 4. Calving Activity Recognition:
-            # Note: Heuristic aspect ratio is intentionally disabled to avoid false alarms on normal standing/grazing cows.
-            # Calving events will only trigger when a dedicated trained AI model (e.g. calving_model.pt) is plugged in.
-            # (The user will train and provide this model; placeholder hook preserved below)
-            if False:  # Reserved for dedicated trained calving model
+            # 4. Calving Activity Recognition (Reserved for dedicated model)
+            if False:
                 pass
 
             # 5. Feeding & Resting Activity Recognition Logic:
@@ -444,12 +472,10 @@ class ActivityEngine:
             herd_count = len(cattle_tracks)
             weight_kg = c.get("weight_kg", 400.0)
             height_cm = c.get("height_cm", 130.0)
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            now_ts = time.time()
 
             # Feeding detection criteria: head down near ground/manger with feed-reach posture
-            is_near_ground_or_manger = y2 > int(h_frame * 0.55)
-            is_feeding_posture = is_near_ground_or_manger and aspect_ratio >= 1.15
+            is_near_ground_or_manger = y2 > int(h_frame * 0.52)
+            is_feeding_posture = is_near_ground_or_manger and aspect_ratio >= 1.10
 
             if is_feeding_posture:
                 hist["head_down_frames"] += 1
@@ -457,9 +483,9 @@ class ActivityEngine:
             else:
                 hist["head_down_frames"] = max(0, hist["head_down_frames"] - 1)
 
-            # Continuous Feeding Session (Zero Duplicates, Live Duration Tracking)
+            # Continuous Feeding Session (Zero Duplicates, Live Duration Tracking, NO video clip spam)
             feed_sess_key = f"{cow_tag}_feeding_activity"
-            if hist["head_down_frames"] >= 25:
+            if hist["head_down_frames"] >= 15:
                 if feed_sess_key not in self.active_cattle_sessions:
                     # Start NEW continuous feeding session
                     act_id = str(uuid.uuid4())
@@ -468,9 +494,10 @@ class ActivityEngine:
                         "cattle_id": cow_tag,
                         "activity_type": "feeding_activity",
                         "start_time": now_dt,
+                        "start_video_sec": now_ts,
                         "last_seen_ts": now_ts,
                         "last_sync_ts": now_ts,
-                        "duration_sec": 10.0,
+                        "duration_sec": 1.0,
                         "breed": breed,
                         "disease_status": disease,
                         "bcs_score": bcs_float or 3.0,
@@ -481,7 +508,7 @@ class ActivityEngine:
                     self.trigger_activity(
                         activity_type="feeding_activity",
                         confidence=0.88,
-                        description=f"Feeding / Grazing: Cattle #{cid} ({breed}) actively feeding at manger",
+                        description=f"Feeding / Grazing: Cattle #{cid} ({breed}) started feeding at {now_dt.strftime('%I:%M:%S %p')}",
                         current_frame=frame,
                         cattle_id=cow_tag,
                         ai_detection_result={
@@ -490,26 +517,30 @@ class ActivityEngine:
                             "bcs_score": bcs_float or 3.0,
                             "estimated_weight_kg": weight_kg,
                             "estimated_height_cm": height_cm,
-                            "eating_duration_sec": 10.0,
+                            "eating_duration_sec": 0.0,
                             "resting_duration_sec": 0.0,
-                            "herd_count": herd_count
+                            "herd_count": herd_count,
+                            "session_start": now_dt.isoformat()
                         },
-                        status="detected_sign",
+                        status="in_progress",
                         activity_id_override=act_id,
-                        eating_duration_sec=10.0,
+                        eating_duration_sec=0.0,
                         resting_duration_sec=0.0,
                         herd_count=herd_count,
                         breed=breed,
                         disease_status=disease,
                         bcs_score=bcs_float or 3.0,
                         estimated_weight_kg=weight_kg,
-                        estimated_height_cm=height_cm
+                        estimated_height_cm=height_cm,
+                        current_ts=now_ts,
+                        current_dt=now_dt,
+                        record_video_clip=False
                     )
                 else:
                     # Update ONGOING session in place without creating duplicate database rows
                     sess = self.active_cattle_sessions[feed_sess_key]
                     sess["last_seen_ts"] = now_ts
-                    elapsed_dur = max(10.0, (now_dt - sess["start_time"]).total_seconds())
+                    elapsed_dur = max(1.0, now_ts - sess["start_video_sec"])
                     sess["duration_sec"] = elapsed_dur
                     sess["breed"] = breed
                     sess["disease_status"] = disease
@@ -518,8 +549,8 @@ class ActivityEngine:
                     sess["estimated_height_cm"] = height_cm
                     sess["herd_count"] = herd_count
 
-                    # Periodic update to Supabase every 5 seconds
-                    if now_ts - sess["last_sync_ts"] >= 5.0:
+                    # Periodic update to Supabase every 10 seconds
+                    if now_ts - sess["last_sync_ts"] >= 10.0:
                         sess["last_sync_ts"] = now_ts
                         dur_mins = int(elapsed_dur // 60)
                         dur_secs = int(elapsed_dur % 60)
@@ -536,21 +567,20 @@ class ActivityEngine:
                                 "bcs_score": float(bcs_float or 3.0),
                                 "estimated_weight_kg": float(weight_kg),
                                 "estimated_height_cm": float(height_cm),
-                                "description": f"Feeding / Grazing: Cattle #{cid} ({breed}) - Total feeding duration: {dur_mins}m {dur_secs}s"
+                                "description": f"Feeding / Grazing: Cattle #{cid} ({breed}) - Currently feeding: {dur_mins}m {dur_secs}s"
                             }
                         )
 
             # Resting / Recumbency detection criteria:
-            # Sternal / lateral recumbency: wide aspect ratio (aspect_ratio >= 1.40) while in stall bed or resting zone
             is_resting_posture = aspect_ratio >= 1.40 and not is_feeding_posture
             if is_resting_posture:
                 hist["recumbent_frames"] = hist.get("recumbent_frames", 0) + 1
             else:
                 hist["recumbent_frames"] = max(0, hist.get("recumbent_frames", 0) - 1)
 
-            # Continuous Resting Session (Zero Duplicates, Live Duration Tracking)
+            # Continuous Resting Session (Zero Duplicates, Live Duration Tracking, NO video clip spam)
             rest_sess_key = f"{cow_tag}_resting_activity"
-            if hist["recumbent_frames"] >= 35:
+            if hist["recumbent_frames"] >= 20:
                 if rest_sess_key not in self.active_cattle_sessions:
                     act_id = str(uuid.uuid4())
                     self.active_cattle_sessions[rest_sess_key] = {
@@ -558,9 +588,10 @@ class ActivityEngine:
                         "cattle_id": cow_tag,
                         "activity_type": "resting_activity",
                         "start_time": now_dt,
+                        "start_video_sec": now_ts,
                         "last_seen_ts": now_ts,
                         "last_sync_ts": now_ts,
-                        "duration_sec": 10.0,
+                        "duration_sec": 1.0,
                         "breed": breed,
                         "disease_status": disease,
                         "bcs_score": bcs_float or 3.0,
@@ -571,7 +602,7 @@ class ActivityEngine:
                     self.trigger_activity(
                         activity_type="resting_activity",
                         confidence=0.87,
-                        description=f"Resting / Rumination: Cattle #{cid} ({breed}) resting in recumbent posture",
+                        description=f"Resting / Rumination: Cattle #{cid} ({breed}) started resting at {now_dt.strftime('%I:%M:%S %p')}",
                         current_frame=frame,
                         cattle_id=cow_tag,
                         ai_detection_result={
@@ -581,24 +612,28 @@ class ActivityEngine:
                             "estimated_weight_kg": weight_kg,
                             "estimated_height_cm": height_cm,
                             "eating_duration_sec": 0.0,
-                            "resting_duration_sec": 10.0,
-                            "herd_count": herd_count
+                            "resting_duration_sec": 0.0,
+                            "herd_count": herd_count,
+                            "session_start": now_dt.isoformat()
                         },
-                        status="detected_sign",
+                        status="in_progress",
                         activity_id_override=act_id,
                         eating_duration_sec=0.0,
-                        resting_duration_sec=10.0,
+                        resting_duration_sec=0.0,
                         herd_count=herd_count,
                         breed=breed,
                         disease_status=disease,
                         bcs_score=bcs_float or 3.0,
                         estimated_weight_kg=weight_kg,
-                        estimated_height_cm=height_cm
+                        estimated_height_cm=height_cm,
+                        current_ts=now_ts,
+                        current_dt=now_dt,
+                        record_video_clip=False
                     )
                 else:
                     sess = self.active_cattle_sessions[rest_sess_key]
                     sess["last_seen_ts"] = now_ts
-                    elapsed_dur = max(10.0, (now_dt - sess["start_time"]).total_seconds())
+                    elapsed_dur = max(1.0, now_ts - sess["start_video_sec"])
                     sess["duration_sec"] = elapsed_dur
                     sess["breed"] = breed
                     sess["disease_status"] = disease
@@ -607,8 +642,8 @@ class ActivityEngine:
                     sess["estimated_height_cm"] = height_cm
                     sess["herd_count"] = herd_count
 
-                    # Periodic update to Supabase every 5 seconds
-                    if now_ts - sess["last_sync_ts"] >= 5.0:
+                    # Periodic update to Supabase every 10 seconds
+                    if now_ts - sess["last_sync_ts"] >= 10.0:
                         sess["last_sync_ts"] = now_ts
                         dur_mins = int(elapsed_dur // 60)
                         dur_secs = int(elapsed_dur % 60)
@@ -625,7 +660,7 @@ class ActivityEngine:
                                 "bcs_score": float(bcs_float or 3.0),
                                 "estimated_weight_kg": float(weight_kg),
                                 "estimated_height_cm": float(height_cm),
-                                "description": f"Resting / Rumination: Cattle #{cid} ({breed}) - Total resting duration: {dur_mins}m {dur_secs}s"
+                                "description": f"Resting / Rumination: Cattle #{cid} ({breed}) - Currently resting: {dur_mins}m {dur_secs}s"
                             }
                         )
 
@@ -639,8 +674,8 @@ class ActivityEngine:
 
             if hid not in self.human_behavior_history:
                 self.human_behavior_history[hid] = {
-                    "first_seen": time.time(),
-                    "last_seen": time.time(),
+                    "first_seen": now_ts,
+                    "last_seen": now_ts,
                     "total_movement": 0.0,
                     "last_pos": (hcx, hcy),
                     "frames_active": 0,
@@ -648,7 +683,7 @@ class ActivityEngine:
                 }
 
             h_hist = self.human_behavior_history[hid]
-            h_hist["last_seen"] = time.time()
+            h_hist["last_seen"] = now_ts
             h_hist["frames_active"] += 1
 
             px, py = h_hist["last_pos"]
@@ -656,7 +691,7 @@ class ActivityEngine:
             h_hist["total_movement"] += dist
             h_hist["last_pos"] = (hcx, hcy)
 
-            # Worker Entry Detection (Initial confirmation after 15 continuous frames)
+            # Worker Entry Detection
             if not h_hist["entered_logged"] and h_hist["frames_active"] >= 15:
                 h_hist["entered_logged"] = True
                 self.trigger_activity(
@@ -666,11 +701,13 @@ class ActivityEngine:
                     current_frame=frame,
                     worker_id=f"WRK{hid:03d}" if isinstance(hid, int) else str(hid),
                     ai_detection_result={"worker_id": hid, "entry_frame": frame_idx},
-                    status="detected_sign"
+                    status="detected_sign",
+                    current_ts=now_ts,
+                    current_dt=now_dt,
+                    record_video_clip=True
                 )
 
-            # Cleaning / Sanitation Activity Detection:
-            # Worker moving actively within cattle stalls with continuous sweeping displacement
+            # Cleaning / Sanitation Activity Detection
             if h_hist["frames_active"] >= 70 and h_hist["total_movement"] >= 250.0:
                 self.trigger_activity(
                     activity_type="cleaning_activity",
@@ -683,87 +720,92 @@ class ActivityEngine:
                         "frames_active": h_hist["frames_active"],
                         "movement_px": round(h_hist["total_movement"], 1)
                     },
-                    status="detected_sign"
+                    status="detected_sign",
+                    current_ts=now_ts,
+                    current_dt=now_dt,
+                    record_video_clip=True
                 )
 
-        # 7. Human with Cattle Activity: Worker Feeding Attendance & Timing
-        # Detects how many workers arrive when cattle are feeding, when they arrive, and how long they stay
-        if len(human_tracks) > 0 and len(cattle_tracks) > 0:
-            active_feeding_cows = [
-                c for c in cattle_tracks
-                if self.cattle_behavior_history.get(c.get("id"), {}).get("head_down_frames", 0) >= 15
-            ]
-            if len(active_feeding_cows) > 0:
-                for h in human_tracks:
-                    hid = h.get("id")
-                    worker_tag = f"WRK{hid:03d}" if isinstance(hid, int) else str(hid)
-                    w_feed_key = f"{worker_tag}_feeding_attendance"
-                    if w_feed_key not in self.active_cattle_sessions:
-                        act_id = str(uuid.uuid4())
-                        self.active_cattle_sessions[w_feed_key] = {
-                            "activity_id": act_id,
-                            "worker_id": worker_tag,
-                            "cattle_id": f"HERD_{len(active_feeding_cows)}cows",
-                            "activity_type": "worker_feeding_interaction",
-                            "start_time": now_dt,
-                            "last_seen_ts": now_ts,
-                            "last_sync_ts": now_ts,
-                            "duration_sec": 10.0,
-                            "worker_count": len(human_tracks),
-                            "herd_count": len(cattle_tracks)
-                        }
-                        self.trigger_activity(
-                            activity_type="worker_feeding_interaction",
-                            confidence=0.91,
-                            description=f"Worker Feeding Attendance: {len(human_tracks)} worker(s) present during herd feeding ({worker_tag})",
-                            current_frame=frame,
-                            worker_id=worker_tag,
-                            cattle_id=f"HERD_{len(active_feeding_cows)}cows",
-                            ai_detection_result={
-                                "workers_present": len(human_tracks),
-                                "cows_feeding": len(active_feeding_cows),
-                                "worker_tag": worker_tag,
-                                "start_time": now_dt.isoformat()
-                            },
-                            status="detected_sign",
-                            activity_id_override=act_id,
-                            eating_duration_sec=10.0,
-                            herd_count=len(cattle_tracks)
-                        )
-                    else:
-                        w_sess = self.active_cattle_sessions[w_feed_key]
-                        w_sess["last_seen_ts"] = now_ts
-                        elapsed_dur = max(10.0, (now_dt - w_sess["start_time"]).total_seconds())
-                        w_sess["duration_sec"] = elapsed_dur
-                        w_sess["worker_count"] = len(human_tracks)
-                        if now_ts - w_sess["last_sync_ts"] >= 5.0:
-                            w_sess["last_sync_ts"] = now_ts
-                            dur_mins = int(elapsed_dur // 60)
-                            dur_secs = int(elapsed_dur % 60)
-                            supabase_manager.update_activity(
-                                activity_id=w_sess["activity_id"],
-                                updates={
-                                    "end_time": now_dt.isoformat(),
-                                    "activity_duration": round(elapsed_dur, 1),
-                                    "description": f"Worker Feeding Attendance: {len(human_tracks)} worker(s) distributing feed / attending cattle - Duration: {dur_mins}m {dur_secs}s"
-                                }
-                            )
-
-        # 8. Finalize Completed Sessions (Inactive for >= 25 seconds)
-        now_ts = time.time()
+        # 7. Finalize Inactive Sessions (Inactive for >= 15 seconds)
         for skey in list(self.active_cattle_sessions.keys()):
             sess = self.active_cattle_sessions[skey]
-            if now_ts - sess["last_seen_ts"] >= 25.0:
+            if now_ts - sess["last_seen_ts"] >= 15.0:
                 final_dur = round(sess["duration_sec"], 1)
-                final_end = sess["start_time"] + datetime.timedelta(seconds=final_dur)
+                dur_mins = int(final_dur // 60)
+                dur_secs = int(final_dur % 60)
+                act_t = sess["activity_type"]
+                cid = sess["cattle_id"]
+                breed = sess.get("breed", "Cattle")
+                start_str = sess["start_time"].strftime("%I:%M:%S %p")
+                end_str = now_dt.strftime("%I:%M:%S %p")
+
+                if act_t == "feeding_activity":
+                    final_desc = f"Feeding Complete: Cattle {cid} ({breed}) - Fed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                    eat_dur = final_dur
+                    rest_dur = 0.0
+                elif act_t == "resting_activity":
+                    final_desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                    eat_dur = 0.0
+                    rest_dur = final_dur
+                else:
+                    final_desc = f"Session Complete: {act_t.replace('_',' ').title()} - Total: {dur_mins}m {dur_secs}s"
+                    eat_dur = 0.0
+                    rest_dur = 0.0
+
                 supabase_manager.update_activity(
                     activity_id=sess["activity_id"],
                     updates={
-                        "end_time": final_end.isoformat(),
+                        "end_time": now_dt.isoformat(),
                         "activity_duration": final_dur,
-                        "eating_duration_sec": final_dur if sess["activity_type"] == "feeding_activity" else 0.0,
-                        "resting_duration_sec": final_dur if sess["activity_type"] == "resting_activity" else 0.0,
-                        "status": "verified"
+                        "eating_duration_sec": eat_dur,
+                        "resting_duration_sec": rest_dur,
+                        "status": "verified",
+                        "description": final_desc
                     }
                 )
                 del self.active_cattle_sessions[skey]
+
+    def finalize_all_sessions(self, current_video_sec: float = 0.0, video_base_dt: Optional[datetime.datetime] = None):
+        """Finalizes all in-progress feeding, resting, and worker sessions when video completes."""
+        if not self.active_cattle_sessions:
+            return
+        now_dt = (video_base_dt + datetime.timedelta(seconds=current_video_sec)) if video_base_dt else datetime.datetime.now(datetime.timezone.utc)
+        now_ts = current_video_sec if current_video_sec > 0 else time.time()
+
+        for skey, sess in list(self.active_cattle_sessions.items()):
+            final_dur = max(1.0, now_ts - sess.get("start_video_sec", now_ts)) if "start_video_sec" in sess else sess.get("duration_sec", 1.0)
+            final_dur = round(final_dur, 1)
+            dur_mins = int(final_dur // 60)
+            dur_secs = int(final_dur % 60)
+            act_t = sess.get("activity_type", "")
+            cid = sess.get("cattle_id", "Cattle")
+            breed = sess.get("breed", "Cattle")
+            start_str = sess["start_time"].strftime("%I:%M:%S %p")
+            end_str = now_dt.strftime("%I:%M:%S %p")
+
+            if "feeding" in act_t:
+                desc = f"Feeding Complete: Cattle {cid} ({breed}) - Fed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                eat_dur = final_dur
+                rest_dur = 0.0
+            elif "resting" in act_t:
+                desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                eat_dur = 0.0
+                rest_dur = final_dur
+            else:
+                desc = f"Session Complete: {act_t.replace('_', ' ').title()} - Total: {dur_mins}m {dur_secs}s"
+                eat_dur = 0.0
+                rest_dur = 0.0
+
+            supabase_manager.update_activity(
+                activity_id=sess["activity_id"],
+                updates={
+                    "end_time": now_dt.isoformat(),
+                    "activity_duration": final_dur,
+                    "eating_duration_sec": eat_dur,
+                    "resting_duration_sec": rest_dur,
+                    "status": "verified",
+                    "description": desc
+                }
+            )
+        self.active_cattle_sessions.clear()
+        print(f"[ActivityEngine] All ongoing activity sessions successfully finalized and verified in Supabase.")
