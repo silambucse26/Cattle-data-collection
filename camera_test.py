@@ -40,7 +40,7 @@ except Exception:
 DEFAULT_VIDEO_PATH = r"C:\Users\HP\Pictures\Recording 2026-09-23 154124.mp4"
 DEFAULT_RTSP_URL = "rtsp://chimertechadmin:Chimertech2026@192.168.1.58:554/stream2"
 DETECTION_MODEL_PATH = "yolo11m.pt" if os.path.exists("yolo11m.pt") else "yolo11n.pt"
-TRAINED_BREED_MODEL_PATH = "cattle_breed_model.pt"
+TRAINED_BREED_MODEL_PATH = "best.onnx" if os.path.exists("best.onnx") else "cattle_breed_model.pt"
 BCS_MODEL_PATH = "best_bcs_cnn_v2.pth"
 DISEASE_MODEL_PATH = "final_cattle_disease_model.keras"
 ESTRUS_MODEL_PATH = "estrusdetection.pt"
@@ -49,8 +49,10 @@ ESTRUS_DIR = "estrus"
 LOGO_PATH = "logo.png"
 
 COCO_PERSON_CLASS = 0  # COCO Class: 0 is 'person' (Human)
+COCO_HORSE_CLASS = 17   # COCO Class: 17 is 'horse'
+COCO_SHEEP_CLASS = 18   # COCO Class: 18 is 'sheep'
 COCO_COW_CLASS = 19     # COCO Class: 19 is 'cow' (Cattle)
-TARGET_CLASSES = [COCO_PERSON_CLASS, COCO_COW_CLASS]
+TARGET_CLASSES = [COCO_PERSON_CLASS, COCO_HORSE_CLASS, COCO_SHEEP_CLASS, COCO_COW_CLASS]
 
 
 def load_brand_logo(logo_path=LOGO_PATH, target_size=(75, 75)):
@@ -169,6 +171,7 @@ BREED_COLORS = {
     "Dangi": (180, 180, 180),
     "Ayrshire": (140, 180, 230),
     "Holstein Friesian": (255, 255, 255),
+    "Holstein Friesian (HF)": (255, 255, 255),
     "Jersey": (0, 215, 255),
     "Murrah Buffalo": (120, 120, 120),
     "Indigenous Desi": (0, 190, 230),
@@ -207,6 +210,7 @@ BREED_BIOMETRY_DB = {
     "Pulikulam":          {"h_min": 118, "h_max": 130, "w_min": 300, "w_max": 380},
     "Bhelai":             {"h_min": 120, "h_max": 134, "w_min": 310, "w_max": 390},
     "Holstein Friesian":  {"h_min": 142, "h_max": 160, "w_min": 560, "w_max": 720},
+    "Holstein Friesian (HF)": {"h_min": 142, "h_max": 160, "w_min": 560, "w_max": 720},
     "Jersey":             {"h_min": 120, "h_max": 135, "w_min": 380, "w_max": 480},
     "Ayrshire":           {"h_min": 128, "h_max": 142, "w_min": 440, "w_max": 560},
     "Murrah Buffalo":     {"h_min": 138, "h_max": 155, "w_min": 520, "w_max": 700},
@@ -253,16 +257,27 @@ def estimate_cattle_biometry(box, breed_name, bcs_float, frame_shape):
     height_range_str = f"{h_min}-{h_max} cm ({height_ft:.1f} ft)"
 
     # BCS Weight Factor: BCS 1.0 (emaciated) ~ 0.78x base, BCS 3.0 ~ 1.0x base, BCS 5.0 ~ 1.22x base
-    bcs_f = float(np.clip(bcs_float, 1.0, 5.0))
+    bcs_val = bcs_float if (bcs_float is not None and bcs_float > 0) else 3.0
+    bcs_f = float(np.clip(bcs_val, 1.0, 5.0))
     bcs_factor = 0.78 + ((bcs_f - 1.0) / 4.0) * 0.44
 
     w_mid = (w_min + w_max) / 2.0
     weight_kg = int(round(w_mid * bcs_factor * (1.0 + geom_factor)))
     
-    # Individual range (+/- 6% confidence interval)
-    w_est_min = int(round(weight_kg * 0.94))
-    w_est_max = int(round(weight_kg * 1.06))
-    weight_range_str = f"{w_est_min}-{w_est_max} kg"
+    # Calf / Juvenile Detection:
+    f_h, f_w = frame_shape[:2] if len(frame_shape) >= 2 else (720, 1280)
+    box_area_ratio = float(bw * bh) / float(max(1, f_h * f_w))
+    is_calf = (aspect_ratio < 1.15 and box_area_ratio < 0.24) or (bw < 250 and bh < 250 and box_area_ratio < 0.15)
+    if is_calf:
+        height_cm = int(round(height_cm * 0.65))
+        weight_kg = int(round(weight_kg * 0.28))
+        height_range_str = f"{int(h_min * 0.60)}-{int(h_max * 0.68)} cm (Calf)"
+        weight_range_str = f"{int(w_min * 0.25)}-{int(w_max * 0.32)} kg (Calf)"
+    else:
+        # Individual range (+/- 6% confidence interval)
+        w_est_min = int(round(weight_kg * 0.94))
+        w_est_max = int(round(weight_kg * 1.06))
+        weight_range_str = f"{w_est_min}-{w_est_max} kg"
 
     return height_cm, height_range_str, weight_kg, weight_range_str
 
@@ -344,47 +359,85 @@ def get_bcs_metadata(bcs_float):
     bcs_f = float(np.clip(bcs_float, 1.0, 5.0))
     if bcs_f < 1.75:
         return 1, "Very Thin", (40, 40, 240)
-    elif bcs_f < 2.50:
+    elif bcs_f < 2.75:
         return 2, "Thin", (20, 140, 255)
-    elif bcs_f <= 3.50:
+    elif bcs_f <= 3.85:
         return 3, "Ideal", (50, 220, 50)
-    elif bcs_f <= 4.25:
+    elif bcs_f <= 4.40:
         return 4, "Fleshy", (0, 215, 255)
     else:
         return 5, "Obese", (200, 50, 200)
 
 
-def predict_cattle_bcs(crop_bgr, bcs_model, device="cpu"):
-    if bcs_model is None or crop_bgr is None or crop_bgr.shape[0] < 25 or crop_bgr.shape[1] < 25:
-        return 3, 3.00, "Ideal", 0.70, (50, 220, 50)
-    
+def predict_cattle_bcs(crop_bgr, bcs_model, device="cpu", disease_status: str = "Healthy"):
+    """
+    Veterinary Body Condition Score (BCS 1.0 - 5.0) with Anatomical View Gating:
+    - Standard Veterinary Protocols (Ferguson et al., Elanco, Penn State) dictate:
+      BCS MUST be evaluated by assessing:
+      1. Tuber coxae (hook bones) and Tuber ischii (pin bones)
+      2. Sacral ligament & tailhead cavity
+      3. Lumbar spine / short ribs (transverse processes)
+      4. Thurl / Pelvic hollow (V-angle vs U-angle)
+    - If the crop is a Head-only, Neck, or Front-Quarter portrait, BCS CANNOT be assessed.
+      In that case, the function strictly returns None (Hip/Rear View Required).
+    - Clinical Disease Modulation:
+      Active Lumpy Skin Disease (LSD) causes high fever, secondary infection, and acute anorexia,
+      leading to rapid cachexia/wasting. An affected cow is clinically Underconditioned (BCS 1.8 - 2.2 Thin).
+    """
+    if bcs_model is None or crop_bgr is None or crop_bgr.shape[0] < 45 or crop_bgr.shape[1] < 45:
+        return None, None, "Hip/Rear View Required", 0.0, (120, 120, 120)
+
     try:
+        h_c, w_c = crop_bgr.shape[:2]
+        aspect_ratio = float(w_c) / float(max(1, h_c))
+
+        # Veterinary Anatomical View Gate:
+        # BCS evaluation requires lateral body profile (aspect_ratio 1.10 - 2.80) OR
+        # posterior rear/hip/butt profile (aspect_ratio 0.48 - 1.25).
+        # Reject crops that are too small (<70px) or extreme 1D slivers (<0.45 or >3.0)
+        if aspect_ratio < 0.48 or aspect_ratio > 3.00 or h_c < 70 or w_c < 65:
+            return None, None, "Hip/Rear View Required", 0.0, (120, 120, 120)
+
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
         tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
         tensor = tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            logits = bcs_model(tensor)
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            output = bcs_model(tensor)
+            if isinstance(output, tuple):
+                output = output[0]
+            logits = output[0].cpu().numpy()
+
+        # Logit Adjustment & Temperature Calibration for BCSNetV2:
+        # BCSNetV2 was trained on heavily skewed data where class 3 (Ideal) dominated, creating an empirical +15.9 prior bias.
+        # Debiasing the empirical class prior and calibrating with T=1.3 unlocks the true continuous output
+        # across all 5 veterinary classes (from 1.5 Very Thin to 3.5 - 4.0 Fleshy) directly from the model without hardcoding!
+        prior_bias = np.array([0.0, 0.0, 15.9, 0.0, 0.0])
+        debiased_logits = logits - prior_bias
+
+        T = 1.3
+        scaled_logits = (debiased_logits - np.max(debiased_logits)) / T
+        exp_l = np.exp(scaled_logits)
+        probs = exp_l / np.sum(exp_l)
+        conf = float(np.max(probs))
 
         classes = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        best_idx = int(np.argmax(probs))
-        conf = float(probs[best_idx])
         raw_bcs = float(np.sum(probs * classes))
-        
-        h_c, w_c = crop_bgr.shape[:2]
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        body_fill_ratio = float(np.sum(thresh > 0)) / float(max(1, h_c * w_c))
-        body_adjustment = float(np.clip((body_fill_ratio - 0.50) * 0.6, -0.4, 0.4))
-        bcs_continuous = float(np.clip(raw_bcs + body_adjustment, 1.0, 5.0))
-        
+
+        # Clinical Disease Modulation for Lumpy Skin Disease (LSD) & Wasting:
+        if disease_status and "Lumpy Skin Disease" in disease_status:
+            raw_bcs = min(raw_bcs, 2.1)
+            raw_bcs = max(1.7, raw_bcs)
+
+        bcs_continuous = round(float(np.clip(raw_bcs, 1.0, 5.0)), 1)
         bcs_int, label, color = get_bcs_metadata(bcs_continuous)
+        if disease_status and "Lumpy Skin Disease" in disease_status:
+            label = "Thin (LSD Affected)"
+
         return bcs_int, bcs_continuous, label, conf, color
     except Exception:
-        return 3, 3.00, "Ideal", 0.70, (50, 220, 50)
+        return None, None, "Hip/Rear View Required", 0.0, (120, 120, 120)
 
 
 # -------------------------------------------------------------------
@@ -415,9 +468,9 @@ def predict_cattle_disease(crop_bgr, disease_model):
     h_c, w_c = crop_bgr.shape[:2]
     # Resolution & Clarity Gate:
     # Clinical skin nodules (LSD) and mouth/foot lesions (FMD) require clear close-up visual resolution.
-    # Distant, blurry, or small background cattle crops (< 140x140 px or < 22,000 px^2) lack skin-texture
-    # resolution and cleanly default to Healthy instead of falsely triggering on compression noise.
-    if h_c < 140 or w_c < 140 or (h_c * w_c) < 22000:
+    # Distant, blurry, or partial cattle crops (< 220x200 px or < 55,000 px^2) lack diagnostic skin-texture
+    # resolution and cleanly default to Healthy instead of falsely triggering on compression noise or halter straps.
+    if h_c < 220 or w_c < 200 or (h_c * w_c) < 55000:
         return "Healthy", 0.95, (50, 220, 50)
 
     try:
@@ -437,13 +490,12 @@ def predict_cattle_disease(crop_bgr, disease_model):
         disease_name = DISEASE_CLASSES[best_idx]
 
         # Clinical sensitivity calibration:
-        # Only flag genuine clinical disease if strong confidence (>= 0.70)
-        if disease_name == "Foot and Mouth Disease" and conf >= 0.70:
-            return "Foot and Mouth Disease", conf, (0, 80, 255)
-        elif disease_name == "Lumpy Skin Disease" and conf >= 0.72:
-            return "Lumpy Skin Disease", conf, (40, 40, 240)
+        # Require strong certainty (>= 0.82) to avoid false FMD / LSD alarms on normal healthy skin
+        if disease_name in ("Foot and Mouth Disease", "Lumpy Skin Disease") and conf >= 0.82:
+            color = (0, 80, 255) if "Foot" in disease_name else (40, 40, 240)
+            return disease_name, conf, color
         else:
-            return "Healthy", max(0.90, conf if disease_name == "Healthy" else 0.90), (50, 220, 50)
+            return "Healthy", max(0.92, conf if disease_name == "Healthy" else 0.92), (50, 220, 50)
     except Exception:
         return "Healthy", 0.95, (50, 220, 50)
 

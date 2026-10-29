@@ -1,3 +1,4 @@
+
 """
 PashuX AI - Single Active Video Analysis Job Queue & Deduplication Engine
 Features:
@@ -69,21 +70,22 @@ class VideoJobQueue:
         filepath: str,
         filename: str,
         farm_id: str,
-        camera_id: str = "CAM01"
+        camera_id: str = "CAM01",
+        enabled_models: Optional[List[str]] = None
     ) -> Tuple[Dict[str, Any], bool]:
         """
-        Submits video to the analysis queue.
+        Submits video to the analysis queue with optional user-selected AI models.
         Returns: (job_dict, is_new_job)
         """
         file_hash = compute_file_hash(filepath)
 
         with self.lock:
-            # Check for existing queued or processing job with identical hash
+            # Check for existing actively queued or processing job with identical hash
             if file_hash in self.hash_to_job:
                 existing_id = self.hash_to_job[file_hash]
                 existing_job = self.jobs.get(existing_id)
-                if existing_job and existing_job["status"] in ("queued", "processing", "completed"):
-                    print(f"[VideoJobQueue] Duplicate upload rejected! Existing job {existing_id} is {existing_job['status']}")
+                if existing_job and existing_job["status"] in ("queued", "processing"):
+                    print(f"[VideoJobQueue] Active job {existing_id} is already in state: {existing_job['status']}")
                     return existing_job, False
 
             job_id = f"job_{uuid.uuid4().hex[:8]}"
@@ -94,6 +96,7 @@ class VideoJobQueue:
                 "filename": filename,
                 "farm_id": farm_id,
                 "camera_id": camera_id,
+                "enabled_models": enabled_models or ["breed", "bcs", "biometry", "disease", "estrus", "worker"],
                 "status": "queued",
                 "progress_percent": 0.0,
                 "frames_processed": 0,

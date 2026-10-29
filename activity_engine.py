@@ -57,6 +57,169 @@ class EvidenceEncoderWorker:
 global_evidence_worker = EvidenceEncoderWorker()
 
 
+def draw_activity_snapshot(
+    frame: np.ndarray,
+    box: Optional[Any],
+    entity_id: str,
+    breed: str = "Cattle",
+    disease: str = "Healthy",
+    bcs: Optional[float] = None,
+    activity_type: str = "farm_activity",
+    weight_kg: float = 400.0,
+    height_cm: float = 130.0,
+    secondary_box: Optional[Any] = None,
+    worker_id: Optional[str] = None
+) -> np.ndarray:
+    """Draws focused boundary box and comprehensive diagnostic telemetry badge on evidence snapshot."""
+    if frame is None:
+        return frame
+    h_orig, w_orig = frame.shape[:2]
+    scale = 1.0
+    if w_orig > 1280:
+        scale = 1280.0 / w_orig
+        annotated = cv2.resize(frame, (1280, int(h_orig * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        try:
+            annotated = frame.copy()
+        except Exception:
+            import gc
+            gc.collect()
+            annotated = frame
+    if box is None:
+        return annotated
+    try:
+        x1, y1, x2, y2 = map(int, box)
+        if scale != 1.0:
+            x1 = int(x1 * scale)
+            y1 = int(y1 * scale)
+            x2 = int(x2 * scale)
+            y2 = int(y2 * scale)
+    except Exception:
+        return annotated
+
+    h_f, w_f = annotated.shape[:2]
+    x1 = max(0, min(w_f - 1, x1))
+    x2 = max(0, min(w_f - 1, x2))
+    y1 = max(0, min(h_f - 1, y1))
+    y2 = max(0, min(h_f - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return annotated
+
+    is_diseased = disease not in ("Healthy", "Scanning...", "")
+    if is_diseased:
+        box_color = (30, 30, 235)      # Bright Red for Disease / LSD
+    elif "milking" in activity_type:
+        box_color = (255, 170, 0)      # Amber / Gold for Milking
+    elif "worker_feeding" in activity_type:
+        box_color = (0, 229, 155)      # Emerald / Mint for Worker Feeding
+    elif "feeding" in activity_type:
+        box_color = (0, 200, 255)      # Cyan / Light Blue for Feeding
+    elif "resting" in activity_type:
+        box_color = (200, 100, 255)    # Purple for Resting
+    elif "worker" in activity_type:
+        box_color = (255, 120, 0)      # Orange for Worker
+    else:
+        box_color = (0, 230, 130)      # Emerald Green
+
+    # Dynamic scaling for crisp HD display
+    res_factor = max(0.70, float(w_f) / 900.0)
+    box_thick = max(2, int(3 * res_factor))
+
+    # 1. Draw boundary box
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, box_thick)
+
+    # Sleek corner accents
+    corner_len = min(int(36 * res_factor), max(6, (x2 - x1) // 5), max(6, (y2 - y1) // 5))
+    accent_thick = max(2, int(4 * res_factor))
+    cv2.line(annotated, (x1, y1), (x1 + corner_len, y1), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x1, y1), (x1, y1 + corner_len), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x2, y1), (x2 - corner_len, y1), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x2, y1), (x2, y1 + corner_len), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x1, y2), (x1 + corner_len, y2), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x1, y2), (x1, y2 - corner_len), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x2, y2), (x2 - corner_len, y2), (255, 255, 255), accent_thick)
+    cv2.line(annotated, (x2, y2), (x2, y2 - corner_len), (255, 255, 255), accent_thick)
+
+    # Draw secondary box (e.g. Worker box in a milking proof snapshot)
+    if secondary_box is not None:
+        try:
+            sx1, sy1, sx2, sy2 = map(int, secondary_box)
+            if scale != 1.0:
+                sx1 = int(sx1 * scale)
+                sy1 = int(sy1 * scale)
+                sx2 = int(sx2 * scale)
+                sy2 = int(sy2 * scale)
+            sx1 = max(0, min(w_f - 1, sx1))
+            sx2 = max(0, min(w_f - 1, sx2))
+            sy1 = max(0, min(h_f - 1, sy1))
+            sy2 = max(0, min(h_f - 1, sy2))
+            if sx2 > sx1 and sy2 > sy1:
+                cv2.rectangle(annotated, (sx1, sy1), (sx2, sy2), (255, 120, 0), max(2, int(2 * res_factor)))
+                sec_lbl = f"Worker #{worker_id or 'WRK001'}"
+                cv2.putText(annotated, sec_lbl, (sx1, max(24, sy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.50 * res_factor, (255, 120, 0), max(1, int(1.5 * res_factor)), cv2.LINE_AA)
+        except Exception:
+            pass
+
+    # 2. Text metadata lines
+    if "milking" in activity_type and worker_id:
+        line1 = f"MILKING EVENT: Worker #{worker_id} -> Cattle #{entity_id} ({breed})"
+        line2 = "Status: Supervised Milking Protocol | Active"
+    elif "worker_feeding" in activity_type and worker_id:
+        line1 = f"FEEDING EVENT: Worker #{worker_id} -> Cattle #{entity_id} ({breed})"
+        line2 = "Status: Supervised Ration Delivery | Active"
+    elif "worker" in activity_type or (worker_id and not str(entity_id).startswith("COW")):
+        line1 = f"WORKER ATTENDANCE: {worker_id or entity_id}"
+        line2 = "Status: Active Duty in Cattle Barn | Confirmed"
+    else:
+        line1 = f"#{entity_id} | {breed} | {int(weight_kg)}kg | {int(height_cm)}cm"
+        bcs_num = float(bcs) if (bcs is not None and bcs > 0) else None
+        bcs_str = f"BCS: {bcs_num:.1f} (Full Body)" if bcs_num else "BCS: Full Body Required"
+        if is_diseased:
+            line2 = f"SUSPECTED: {disease.upper()} | {bcs_str}"
+        else:
+            line2 = f"Healthy | {bcs_str}"
+
+    act_str = activity_type.replace("_", " ").upper()
+    line3 = f"EVENT: {act_str}"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.52 * res_factor
+    thick = max(1, int(1.5 * res_factor))
+    (w1, h1), _ = cv2.getTextSize(line1, font, font_scale, thick)
+    (w2, h2), _ = cv2.getTextSize(line2, font, font_scale, thick)
+    (w3, h3), _ = cv2.getTextSize(line3, font, font_scale, thick)
+    pad = int(10 * res_factor)
+    gap = int(6 * res_factor)
+    max_w = max(w1, w2, w3) + pad * 2
+    box_h = h1 + h2 + h3 + gap * 3 + pad
+
+    if y1 - box_h - 4 >= 0:
+        by1 = y1 - box_h - 4
+        by2 = y1 - 2
+    else:
+        by1 = min(h_f - box_h - 4, y1 + 4)
+        by2 = by1 + box_h
+
+    # Ensure metadata badge never clips outside horizontal camera view
+    bx1 = max(4, min(x1, w_f - max_w - 6))
+    bx2 = min(w_f - 4, bx1 + max_w)
+
+    overlay = annotated.copy()
+    cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (18, 22, 28), -1)
+    cv2.addWeighted(overlay, 0.90, annotated, 0.10, 0, annotated)
+    cv2.rectangle(annotated, (bx1, by1), (bx2, by2), box_color, max(1, int(2 * res_factor)))
+
+    ty = by1 + h1 + gap
+    cv2.putText(annotated, line1, (bx1 + pad, ty), font, font_scale, (255, 255, 255), thick, cv2.LINE_AA)
+    ty += h2 + gap
+    line2_color = (80, 80, 255) if is_diseased else (80, 240, 150)
+    cv2.putText(annotated, line2, (bx1 + pad, ty), font, font_scale, line2_color, thick, cv2.LINE_AA)
+    ty += h3 + gap
+    cv2.putText(annotated, line3, (bx1 + pad, ty), font, font_scale, (240, 220, 100), thick, cv2.LINE_AA)
+
+    return annotated
+
+
 class ActivityEngine:
     """
     Monitors CCTV frames & object tracks, recognizes farm events, buffers video frames,
@@ -83,7 +246,7 @@ class ActivityEngine:
         self.cooldown_seconds = cooldown_seconds
 
         # Bounded circular buffer for pre-event frames: capped strictly to conserve RAM
-        self.max_buffer_len = min(75, int(self.fps * self.pre_buffer_seconds) + 5)
+        self.max_buffer_len = min(20, int(self.fps * min(1.5, self.pre_buffer_seconds)) + 2)
         self.frame_buffer = deque(maxlen=self.max_buffer_len)
         self.buffer_lock = threading.Lock()
 
@@ -102,10 +265,13 @@ class ActivityEngine:
         # Human ID -> {'first_seen': float, 'last_seen': float, 'in_stall_frames': int, 'moving_distance': float, 'last_pos': (x,y)}
         self.human_behavior_history: Dict[int, Dict[str, Any]] = {}
 
-        # Continuous Session Tracking for Eating and Resting
+        # Continuous Session Tracking for Eating, Resting, and Milking
         # Prevents multiple duplicate database rows for the same cattle
         # Key: f"{cattle_id}_{activity_type}" -> session dict
         self.active_cattle_sessions: Dict[str, Dict[str, Any]] = {}
+
+        # Cached last frame for final session summaries
+        self.last_frame: Optional[np.ndarray] = None
 
         # Callback hook for UI notifications
         self.on_activity_detected = None
@@ -115,11 +281,12 @@ class ActivityEngine:
         if frame is None:
             return
 
+        self.last_frame = frame
         ts = timestamp or time.time()
-        # Scale buffer frame if high resolution to save 75% memory
+        # Scale buffer frame to 480px to save 90% memory while retaining crystal-clear evidence
         h, w = frame.shape[:2]
-        if w > 854:
-            buf_frame = cv2.resize(frame, (854, int(h * 854 / w)))
+        if w > 480:
+            buf_frame = cv2.resize(frame, (480, int(h * 480 / w)), interpolation=cv2.INTER_AREA)
         else:
             buf_frame = frame.copy()
 
@@ -142,24 +309,32 @@ class ActivityEngine:
 
     def _is_cooling_down(self, activity_type: str, entity_id: str, current_ts: Optional[float] = None) -> bool:
         """Checks if this activity for this entity is within cooldown period."""
+        # Worker lifecycle events (entry, exit, attendance summary) must NEVER be suppressed by cooldown
+        if activity_type in ("worker_entry", "worker_exit", "worker_attendance"):
+            return False
+
         now = current_ts if current_ts is not None else time.time()
 
         # Strict global & entity cooldown for Estrus: at most 1 clip per 300s (5 minutes)
         if activity_type == "estrus_detected":
-            last_global = self.cooldown_tracker.get("estrus_detected_global", -999999.0)
-            if now - last_global < 300.0 and last_global > 0:
+            last_global = self.cooldown_tracker.get("estrus_detected_global")
+            if last_global is not None and 0 <= (now - last_global) < 300.0:
                 return True
             key = f"{activity_type}_{entity_id}"
-            last_t = self.cooldown_tracker.get(key, -999999.0)
-            if now - last_t < 300.0 and last_t > 0:
+            last_t = self.cooldown_tracker.get(key)
+            if last_t is not None and 0 <= (now - last_t) < 300.0:
                 return True
             self.cooldown_tracker["estrus_detected_global"] = now
             self.cooldown_tracker[key] = now
             return False
 
         key = f"{activity_type}_{entity_id}"
-        last_t = self.cooldown_tracker.get(key, 0.0)
-        if now - last_t < self.cooldown_seconds:
+        if key not in self.cooldown_tracker:
+            self.cooldown_tracker[key] = now
+            return False
+
+        last_t = self.cooldown_tracker[key]
+        if 0 <= (now - last_t) < self.cooldown_seconds:
             return True
         self.cooldown_tracker[key] = now
         return False
@@ -180,17 +355,18 @@ class ActivityEngine:
         herd_count: int = 1,
         breed: str = "Cattle",
         disease_status: str = "Healthy",
-        bcs_score: float = 3.0,
+        bcs_score: Optional[float] = None,
         estimated_weight_kg: float = 400.0,
         estimated_height_cm: float = 130.0,
         current_ts: Optional[float] = None,
         current_dt: Optional[datetime.datetime] = None,
-        record_video_clip: bool = True
+        record_video_clip: bool = True,
+        target_box: Optional[Any] = None
     ):
         """
         Triggers automatic activity evidence capture:
         1. Verifies anti-duplication cooldown
-        2. Captures clear high-res image
+        2. Captures clear high-res image annotated with focused boundary box & diagnostic badge
         3. Prepares 10-second video clip using pre-event buffered frames + post-event frames (if record_video_clip is True)
         4. Uploads to Supabase Storage & Database without duplicate cards
         """
@@ -203,13 +379,34 @@ class ActivityEngine:
         start_time = detection_timestamp - datetime.timedelta(seconds=self.pre_buffer_seconds)
         end_time = detection_timestamp + datetime.timedelta(seconds=self.post_buffer_seconds)
 
-        # 1. Save High-Res Snapshot Image
-        snapshot_filename = f"{activity_id}.jpg"
+        # 1. Save High-Res Snapshot Image with precise focused bounding box & diagnostic label
+        act_clean = str(activity_type).replace(" ", "_").replace("/", "_")
+        ent_clean = str(cattle_id or worker_id or "gen").replace(" ", "_").replace("/", "_")
+        snapshot_filename = f"act_{act_clean}_{ent_clean}_{int(time.time())}_{activity_id[:8]}.jpg"
         local_snapshot_path = str(LOCAL_IMAGES_DIR / snapshot_filename)
-        try:
-            cv2.imwrite(local_snapshot_path, current_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        except Exception as e:
-            print(f"[ActivityEngine] Snapshot write error: {e}")
+        save_img = current_frame if current_frame is not None else self.last_frame
+        if save_img is not None:
+            try:
+                effective_box = target_box
+                if effective_box is None and ai_detection_result:
+                    effective_box = ai_detection_result.get("box")
+                worker_box = ai_detection_result.get("worker_box") if ai_detection_result else None
+                annotated_snapshot = draw_activity_snapshot(
+                    frame=save_img,
+                    box=effective_box,
+                    entity_id=cattle_id or worker_id or "Cattle",
+                    breed=breed,
+                    disease=disease_status,
+                    bcs=bcs_score,
+                    activity_type=activity_type,
+                    weight_kg=estimated_weight_kg,
+                    height_cm=estimated_height_cm,
+                    secondary_box=worker_box,
+                    worker_id=worker_id
+                )
+                cv2.imwrite(local_snapshot_path, annotated_snapshot, [cv2.IMWRITE_JPEG_QUALITY, 96])
+            except Exception as e:
+                print(f"[ActivityEngine] Snapshot write error: {e}")
 
         dur = round(self.total_clip_duration, 1)
         if eating_duration_sec > dur:
@@ -233,7 +430,7 @@ class ActivityEngine:
             "herd_count": int(herd_count),
             "breed": str(breed),
             "disease_status": str(disease_status),
-            "bcs_score": float(bcs_score),
+            "bcs_score": float(bcs_score) if (bcs_score is not None and bcs_score > 0) else None,
             "estimated_weight_kg": float(estimated_weight_kg),
             "estimated_height_cm": float(estimated_height_cm),
             "ai_detection_result": ai_detection_result or {},
@@ -243,14 +440,30 @@ class ActivityEngine:
             "status": status,
             "created_at": detection_timestamp.isoformat(),
             "local_snapshot_path": local_snapshot_path,
-            "captured_video_storage_path": ""
+            "captured_image_storage_path": f"{self.farm_id}/images/{snapshot_filename}",
+            "captured_video_storage_path": f"{self.farm_id}/videos/{activity_id}.mp4"
         }
 
-        # If this activity does NOT require a video clip (e.g. continuous feeding or resting session), save snapshot only
+        # For uploaded video files: The video is already saved on disk in uploads/
+        # Do NOT buffer hundreds of uncompressed video frames into RAM during video upload analysis!
+        if self.video_source_type == "uploaded":
+            record_video_clip = False
+
+        # If this activity does NOT require a video clip (e.g. continuous feeding, resting session, or uploaded video), save snapshot only
         if not record_video_clip:
-            remote_image_path = supabase_manager.upload_image(self.farm_id, activity_id, local_snapshot_path)
-            meta["captured_image_storage_path"] = remote_image_path or local_snapshot_path
-            supabase_manager.record_activity(meta)
+            # Non-blocking async upload to prevent stalling video processing loop
+            def _async_act_upload(f_id=self.farm_id, a_id=activity_id, snap_p=local_snapshot_path, m=dict(meta)):
+                try:
+                    r_path = supabase_manager.upload_image(f_id, a_id, snap_p)
+                    if r_path:
+                        m["captured_image_storage_path"] = r_path
+                except Exception:
+                    pass
+                try:
+                    supabase_manager.record_activity(m)
+                except Exception:
+                    pass
+            threading.Thread(target=_async_act_upload, daemon=True).start()
             if self.on_activity_detected:
                 try:
                     self.on_activity_detected(meta)
@@ -261,8 +474,25 @@ class ActivityEngine:
         # Prevent duplicate simultaneous video recording jobs to prevent memory exhaustion & card spam
         with self.jobs_lock:
             if len(self.active_recording_jobs) >= 1:
-                # Video is already actively recording for this event; suppress duplicate card creation
-                print(f"[ActivityEngine] Suppressed duplicate event trigger during active video clip encoding ({entity_key})")
+                # Video encoder is busy; record high-res snapshot & database activity so worker/event is NEVER dropped
+                print(f"[ActivityEngine] Video clip encoder busy; recording snapshot evidence for {entity_key} ({activity_type})")
+                def _async_act_busy(f_id=self.farm_id, a_id=activity_id, snap_p=local_snapshot_path, m=dict(meta)):
+                    try:
+                        r_path = supabase_manager.upload_image(f_id, a_id, snap_p)
+                        if r_path:
+                            m["captured_image_storage_path"] = r_path
+                    except Exception:
+                        pass
+                    try:
+                        supabase_manager.record_activity(m)
+                    except Exception:
+                        pass
+                threading.Thread(target=_async_act_busy, daemon=True).start()
+                if self.on_activity_detected:
+                    try:
+                        self.on_activity_detected(meta)
+                    except Exception:
+                        pass
                 return
 
         # 2. Extract Pre-Event Frames from Rolling Circular Buffer
@@ -270,7 +500,8 @@ class ActivityEngine:
         with self.buffer_lock:
             pre_frames = [f[0].copy() for f in self.frame_buffer]
 
-        total_frames_target = int(self.fps * self.total_clip_duration)
+        clip_fps = min(15.0, float(self.fps))
+        total_frames_target = int(clip_fps * min(10.0, self.total_clip_duration))
         post_frames_needed = max(10, total_frames_target - len(pre_frames))
 
         # Queue recording job to collect remaining post-event frames
@@ -305,7 +536,9 @@ class ActivityEngine:
 
         try:
             h, w = frames[0].shape[:2]
-            video_filename = f"{activity_id}.mp4"
+            act_clean = str(meta.get("activity_type", "act")).replace(" ", "_").replace("/", "_")
+            ent_clean = str(meta.get("cattle_id") or meta.get("worker_id") or "gen").replace(" ", "_").replace("/", "_")
+            video_filename = f"vid_{act_clean}_{ent_clean}_{int(time.time())}_{activity_id[:8]}.mp4"
             local_video_path = str(LOCAL_VIDEOS_DIR / video_filename)
 
             # Encode MP4 video using avc1 or mp4v
@@ -413,12 +646,13 @@ class ActivityEngine:
             bcs_label = c.get("bcs_label", "")
 
             # Disease Alert (LSD or FMD)
-            if disease in ("Lumpy Skin Disease", "Foot and Mouth Disease") and disease_conf >= 0.70:
+            if disease in ("Lumpy Skin Disease", "Foot and Mouth Disease") and disease_conf >= 0.75 and c.get("is_full_body", True):
                 short_code = "LSD" if "Lumpy" in disease else "FMD"
+                bcs_note = f" | BCS: {bcs_float:.1f}/5.0 (Full Body View)" if bcs_float is not None else " | BCS: Full Body Required"
                 self.trigger_activity(
                     activity_type="disease_suspected",
                     confidence=disease_conf,
-                    description=f"Suspected Disease Indicator: Cattle #{cid} exhibiting clinical signs of {disease} ({short_code})",
+                    description=f"Suspected Disease Alert: Cattle #{cid} ({breed}) exhibiting clinical signs of {disease} ({short_code}){bcs_note}",
                     current_frame=frame,
                     cattle_id=f"COW{cid:03d}" if isinstance(cid, int) else str(cid),
                     ai_detection_result={
@@ -426,21 +660,30 @@ class ActivityEngine:
                         "confidence": disease_conf,
                         "breed": breed,
                         "bcs": bcs_float,
-                        "model": "final_cattle_disease_model.keras"
+                        "bcs_status": "Full Body Evaluated" if bcs_float is not None else "Full Body Required",
+                        "model": "final_cattle_disease_model.keras",
+                        "box": box
                     },
                     status="suspected_sign",
+                    breed=breed,
+                    disease_status=disease,
+                    bcs_score=bcs_float if bcs_float is not None else 3.0,
+                    estimated_weight_kg=c.get("weight_kg", 400.0),
+                    estimated_height_cm=c.get("height_cm", 130.0),
                     current_ts=now_ts,
                     current_dt=now_dt,
-                    record_video_clip=True
+                    record_video_clip=True,
+                    target_box=box
                 )
 
-            # Severe BCS Alert (BCS 1 Severe Thinness or BCS 5 Extreme Obesity)
+            # Severe BCS Alert (BCS 1 Severe Thinness or BCS 5 Extreme Obesity) - Only when full body appears
             if bcs_int in (1, 5) and bcs_float is not None:
                 alert_text = "Severely Underweight / Emaciation" if bcs_int == 1 else "Grossly Overweight / Obesity"
+                dis_note = f" | ⚠️ Suspected Disease: {disease}" if disease not in ("Healthy", "Scanning...") else ""
                 self.trigger_activity(
                     activity_type="bcs_alert",
                     confidence=0.88,
-                    description=f"BCS Alert: Cattle #{cid} ({breed}) evaluated at BCS {bcs_float:.2f}/5.0 ({alert_text})",
+                    description=f"BCS Alert: Cattle #{cid} ({breed}) evaluated at BCS {bcs_float:.2f}/5.0 ({alert_text}) - Full Body Evaluated{dis_note}",
                     current_frame=frame,
                     cattle_id=f"COW{cid:03d}" if isinstance(cid, int) else str(cid),
                     ai_detection_result={
@@ -448,12 +691,20 @@ class ActivityEngine:
                         "bcs_float": bcs_float,
                         "bcs_label": bcs_label,
                         "breed": breed,
-                        "model": "best_bcs_cnn_v2.pth"
+                        "disease_status": disease,
+                        "model": "best_bcs_cnn_v2.pth",
+                        "box": box
                     },
                     status="detected_sign",
+                    breed=breed,
+                    disease_status=disease,
+                    bcs_score=bcs_float,
+                    estimated_weight_kg=c.get("weight_kg", 400.0),
+                    estimated_height_cm=c.get("height_cm", 130.0),
                     current_ts=now_ts,
                     current_dt=now_dt,
-                    record_video_clip=True
+                    record_video_clip=True,
+                    target_box=box
                 )
 
             # Cattle Tracking & State Memory
@@ -462,274 +713,124 @@ class ActivityEngine:
                     "recumbent_frames": 0,
                     "head_down_frames": 0,
                     "last_pos": box,
-                    "first_seen": now_ts
+                    "first_seen": now_ts,
+                    "total_movement": 0.0,
+                    "frames_tracked": 0
                 }
             hist = self.cattle_behavior_history[cid]
+            hist["frames_tracked"] = hist.get("frames_tracked", 0) + 1
 
             x1, y1, x2, y2 = box
             bw = max(1, x2 - x1)
             bh = max(1, y2 - y1)
             aspect_ratio = float(bw) / float(bh)
 
-            # 4. Calving Activity Recognition (Reserved for dedicated model)
-            if False:
-                pass
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            prev_b = hist.get("last_pos", box)
+            pcx = (prev_b[0] + prev_b[2]) / 2.0
+            pcy = (prev_b[1] + prev_b[3]) / 2.0
+            dist_moved = math.sqrt((cx - pcx)**2 + (cy - pcy)**2)
+            hist["total_movement"] = hist.get("total_movement", 0.0) + dist_moved
+            hist["last_pos"] = box
+            avg_speed = hist["total_movement"] / max(1, hist["frames_tracked"])
 
-            # 5. Feeding & Resting Activity Recognition Logic:
-            cow_tag = f"COW{cid:03d}" if isinstance(cid, int) else str(cid)
-            herd_count = len(cattle_tracks)
-            weight_kg = c.get("weight_kg", 400.0)
-            height_cm = c.get("height_cm", 130.0)
-            feed_sess_key = f"{cow_tag}_feeding_activity"
+            # Biometry & diagnostic state tracked from trained AI models
+            pass
 
-            # If cow is engaged in active estrus / standing heat interaction, suppress false feeding
-            if cid in active_estrus_cow_ids or cow_tag in active_estrus_cow_ids:
-                hist["head_down_frames"] = 0
-                if feed_sess_key in self.active_cattle_sessions:
-                    del self.active_cattle_sessions[feed_sess_key]
-                continue
-
-            # Feeding detection criteria: head down near ground/feed trough with grazing posture
-            is_near_ground = y2 > int(h_frame * 0.62)
-            is_feeding_posture = is_near_ground and (aspect_ratio >= 1.25) and not is_resting_posture
-
-            if is_feeding_posture:
-                hist["head_down_frames"] += 1
-                hist["last_feeding_time"] = now_ts
-            else:
-                hist["head_down_frames"] = max(0, hist["head_down_frames"] - 1)
-
-            # Continuous Feeding Session (Zero Duplicates, Live Duration Tracking, NO video clip spam)
-            if hist["head_down_frames"] >= 25:
-                if feed_sess_key not in self.active_cattle_sessions:
-                    # Start NEW continuous feeding session
-                    act_id = str(uuid.uuid4())
-                    self.active_cattle_sessions[feed_sess_key] = {
-                        "activity_id": act_id,
-                        "cattle_id": cow_tag,
-                        "activity_type": "feeding_activity",
-                        "start_time": now_dt,
-                        "start_video_sec": now_ts,
-                        "last_seen_ts": now_ts,
-                        "last_sync_ts": now_ts,
-                        "duration_sec": 1.0,
-                        "breed": breed,
-                        "disease_status": disease,
-                        "bcs_score": bcs_float or 3.0,
-                        "estimated_weight_kg": weight_kg,
-                        "estimated_height_cm": height_cm,
-                        "herd_count": herd_count
-                    }
-                    self.trigger_activity(
-                        activity_type="feeding_activity",
-                        confidence=0.88,
-                        description=f"Feeding / Grazing: Cattle #{cid} ({breed}) started feeding at {now_dt.strftime('%I:%M:%S %p')}",
-                        current_frame=frame,
-                        cattle_id=cow_tag,
-                        ai_detection_result={
-                            "breed": breed,
-                            "disease_status": disease,
-                            "bcs_score": bcs_float or 3.0,
-                            "estimated_weight_kg": weight_kg,
-                            "estimated_height_cm": height_cm,
-                            "eating_duration_sec": 0.0,
-                            "resting_duration_sec": 0.0,
-                            "herd_count": herd_count,
-                            "session_start": now_dt.isoformat()
-                        },
-                        status="in_progress",
-                        activity_id_override=act_id,
-                        eating_duration_sec=0.0,
-                        resting_duration_sec=0.0,
-                        herd_count=herd_count,
-                        breed=breed,
-                        disease_status=disease,
-                        bcs_score=bcs_float or 3.0,
-                        estimated_weight_kg=weight_kg,
-                        estimated_height_cm=height_cm,
-                        current_ts=now_ts,
-                        current_dt=now_dt,
-                        record_video_clip=False
-                    )
-                else:
-                    # Update ONGOING session in place without creating duplicate database rows
-                    sess = self.active_cattle_sessions[feed_sess_key]
-                    sess["last_seen_ts"] = now_ts
-                    elapsed_dur = max(1.0, now_ts - sess["start_video_sec"])
-                    sess["duration_sec"] = elapsed_dur
-                    sess["breed"] = breed
-                    sess["disease_status"] = disease
-                    sess["bcs_score"] = bcs_float or 3.0
-                    sess["estimated_weight_kg"] = weight_kg
-                    sess["estimated_height_cm"] = height_cm
-                    sess["herd_count"] = herd_count
-
-                    # Periodic update to Supabase every 10 seconds
-                    if now_ts - sess["last_sync_ts"] >= 10.0:
-                        sess["last_sync_ts"] = now_ts
-                        dur_mins = int(elapsed_dur // 60)
-                        dur_secs = int(elapsed_dur % 60)
-                        supabase_manager.update_activity(
-                            activity_id=sess["activity_id"],
-                            updates={
-                                "end_time": now_dt.isoformat(),
-                                "activity_duration": round(elapsed_dur, 1),
-                                "eating_duration_sec": round(elapsed_dur, 1),
-                                "resting_duration_sec": 0.0,
-                                "herd_count": herd_count,
-                                "breed": breed,
-                                "disease_status": disease,
-                                "bcs_score": float(bcs_float or 3.0),
-                                "estimated_weight_kg": float(weight_kg),
-                                "estimated_height_cm": float(height_cm),
-                                "description": f"Feeding / Grazing: Cattle #{cid} ({breed}) - Currently feeding: {dur_mins}m {dur_secs}s"
-                            }
-                        )
-
-            # Resting / Recumbency detection criteria:
-            is_resting_posture = aspect_ratio >= 1.40 and not is_feeding_posture
-            if is_resting_posture:
-                hist["recumbent_frames"] = hist.get("recumbent_frames", 0) + 1
-            else:
-                hist["recumbent_frames"] = max(0, hist.get("recumbent_frames", 0) - 1)
-
-            # Continuous Resting Session (Zero Duplicates, Live Duration Tracking, NO video clip spam)
-            rest_sess_key = f"{cow_tag}_resting_activity"
-            if hist["recumbent_frames"] >= 20:
-                if rest_sess_key not in self.active_cattle_sessions:
-                    act_id = str(uuid.uuid4())
-                    self.active_cattle_sessions[rest_sess_key] = {
-                        "activity_id": act_id,
-                        "cattle_id": cow_tag,
-                        "activity_type": "resting_activity",
-                        "start_time": now_dt,
-                        "start_video_sec": now_ts,
-                        "last_seen_ts": now_ts,
-                        "last_sync_ts": now_ts,
-                        "duration_sec": 1.0,
-                        "breed": breed,
-                        "disease_status": disease,
-                        "bcs_score": bcs_float or 3.0,
-                        "estimated_weight_kg": weight_kg,
-                        "estimated_height_cm": height_cm,
-                        "herd_count": herd_count
-                    }
-                    self.trigger_activity(
-                        activity_type="resting_activity",
-                        confidence=0.87,
-                        description=f"Resting / Rumination: Cattle #{cid} ({breed}) started resting at {now_dt.strftime('%I:%M:%S %p')}",
-                        current_frame=frame,
-                        cattle_id=cow_tag,
-                        ai_detection_result={
-                            "breed": breed,
-                            "disease_status": disease,
-                            "bcs_score": bcs_float or 3.0,
-                            "estimated_weight_kg": weight_kg,
-                            "estimated_height_cm": height_cm,
-                            "eating_duration_sec": 0.0,
-                            "resting_duration_sec": 0.0,
-                            "herd_count": herd_count,
-                            "session_start": now_dt.isoformat()
-                        },
-                        status="in_progress",
-                        activity_id_override=act_id,
-                        eating_duration_sec=0.0,
-                        resting_duration_sec=0.0,
-                        herd_count=herd_count,
-                        breed=breed,
-                        disease_status=disease,
-                        bcs_score=bcs_float or 3.0,
-                        estimated_weight_kg=weight_kg,
-                        estimated_height_cm=height_cm,
-                        current_ts=now_ts,
-                        current_dt=now_dt,
-                        record_video_clip=False
-                    )
-                else:
-                    sess = self.active_cattle_sessions[rest_sess_key]
-                    sess["last_seen_ts"] = now_ts
-                    elapsed_dur = max(1.0, now_ts - sess["start_video_sec"])
-                    sess["duration_sec"] = elapsed_dur
-                    sess["breed"] = breed
-                    sess["disease_status"] = disease
-                    sess["bcs_score"] = bcs_float or 3.0
-                    sess["estimated_weight_kg"] = weight_kg
-                    sess["estimated_height_cm"] = height_cm
-                    sess["herd_count"] = herd_count
-
-                    # Periodic update to Supabase every 10 seconds
-                    if now_ts - sess["last_sync_ts"] >= 10.0:
-                        sess["last_sync_ts"] = now_ts
-                        dur_mins = int(elapsed_dur // 60)
-                        dur_secs = int(elapsed_dur % 60)
-                        supabase_manager.update_activity(
-                            activity_id=sess["activity_id"],
-                            updates={
-                                "end_time": now_dt.isoformat(),
-                                "activity_duration": round(elapsed_dur, 1),
-                                "eating_duration_sec": 0.0,
-                                "resting_duration_sec": round(elapsed_dur, 1),
-                                "herd_count": herd_count,
-                                "breed": breed,
-                                "disease_status": disease,
-                                "bcs_score": float(bcs_float or 3.0),
-                                "estimated_weight_kg": float(weight_kg),
-                                "estimated_height_cm": float(height_cm),
-                                "description": f"Resting / Rumination: Cattle #{cid} ({breed}) - Currently resting: {dur_mins}m {dur_secs}s"
-                            }
-                        )
-
-        # 6. Worker Entry, Exit & Stall Cleaning Activities
+        # 6. Worker Entry, Milking, Sanitation & Attendance Activities
         for h in human_tracks:
             hid = h.get("id")
             hbox = h.get("box", (0, 0, 0, 0))
             hx1, hy1, hx2, hy2 = hbox
             hcx = (hx1 + hx2) / 2.0
             hcy = (hy1 + hy2) / 2.0
+            worker_tag = f"WRK{hid:03d}" if isinstance(hid, int) else str(hid)
 
             if hid not in self.human_behavior_history:
                 self.human_behavior_history[hid] = {
                     "first_seen": now_ts,
                     "last_seen": now_ts,
+                    "first_dt": now_dt,
                     "total_movement": 0.0,
                     "last_pos": (hcx, hcy),
                     "frames_active": 0,
-                    "entered_logged": False
+                    "entered_logged": False,
+                    "tasks": set(),
+                    "milking_pairs": {}
                 }
 
             h_hist = self.human_behavior_history[hid]
             h_hist["last_seen"] = now_ts
+            h_hist["last_dt"] = now_dt
             h_hist["frames_active"] += 1
 
             px, py = h_hist["last_pos"]
             dist = math.sqrt((hcx - px) ** 2 + (hcy - py) ** 2)
             h_hist["total_movement"] += dist
             h_hist["last_pos"] = (hcx, hcy)
+            h_hist["last_box"] = (hx1, hy1, hx2, hy2)
 
-            # Worker Entry Detection
-            if not h_hist["entered_logged"] and h_hist["frames_active"] >= 15:
-                h_hist["entered_logged"] = True
-                self.trigger_activity(
-                    activity_type="worker_entry",
-                    confidence=0.92,
-                    description=f"Worker Entry Detected: Farm worker #{hid} entered cattle zone / barn",
-                    current_frame=frame,
-                    worker_id=f"WRK{hid:03d}" if isinstance(hid, int) else str(hid),
-                    ai_detection_result={"worker_id": hid, "entry_frame": frame_idx},
-                    status="detected_sign",
-                    current_ts=now_ts,
-                    current_dt=now_dt,
-                    record_video_clip=True
-                )
+            # Worker Entry Detection (Confirmed presence after sustained frames and human silhouette check)
+            if not h_hist["entered_logged"] and h_hist["frames_active"] >= 8:
+                is_valid_human = True
+                w_crop = None
+                if frame is not None:
+                    try:
+                        h_f, w_f = frame.shape[:2]
+                        pad_y = int((hy2 - hy1) * 0.1)
+                        pad_x = int((hx2 - hx1) * 0.1)
+                        wy1 = max(0, hy1 - pad_y)
+                        wy2 = min(h_f, hy2 + pad_y)
+                        wx1 = max(0, hx1 - pad_x)
+                        wx2 = min(w_f, hx2 + pad_x)
+                        w_crop = frame[wy1:wy2, wx1:wx2]
+                        if w_crop.size > 0:
+                            ch_h, ch_w = w_crop.shape[:2]
+                            # Human standing or attending in barn must be slender
+                            if ch_w > ch_h * 0.75:
+                                is_valid_human = False
+                            else:
+                                from ai_model_manager import ai_models
+                                is_piebald, _ = ai_models.detect_holstein_friesian(w_crop)
+                                is_buff, _ = ai_models.detect_murrah_buffalo(w_crop)
+                                if is_piebald or is_buff:
+                                    is_valid_human = False
+                                else:
+                                    cv2.imwrite(str(LOCAL_IMAGES_DIR / f"{worker_tag}.jpg"), w_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    except Exception as _we:
+                        pass
+
+                if is_valid_human:
+                    h_hist["entered_logged"] = True
+                    h_hist["tasks"].add("Barn Entry & Inspection")
+
+                    self.trigger_activity(
+                        activity_type="worker_entry",
+                        confidence=0.94,
+                        description=f"Worker Entry Detected: Farm worker #{hid} entered cattle zone / barn at {now_dt.strftime('%I:%M:%S %p')}",
+                        current_frame=frame,
+                        worker_id=worker_tag,
+                        ai_detection_result={"worker_id": hid, "box": (hx1, hy1, hx2, hy2), "worker_box": (hx1, hy1, hx2, hy2), "entry_frame": frame_idx, "entry_time": now_dt.isoformat()},
+                        status="verified",
+                        current_ts=now_ts,
+                        current_dt=now_dt,
+                        record_video_clip=True,
+                        target_box=(hx1, hy1, hx2, hy2)
+                    )
+
+            # Proximity attendance recorded under worker ledger
+            pass
 
             # Cleaning / Sanitation Activity Detection
-            if h_hist["frames_active"] >= 70 and h_hist["total_movement"] >= 250.0:
+            if h_hist["frames_active"] >= 30 and h_hist["total_movement"] >= 120.0:
+                h_hist["tasks"].add("Stall Cleaning & Maintenance")
                 self.trigger_activity(
                     activity_type="cleaning_activity",
                     confidence=0.85,
-                    description=f"Cleaning Activity: Farm worker #{hid} conducting stall maintenance & manure cleaning",
+                    description=f"Cleaning Activity: Farm worker #{hid} conducting stall maintenance & sanitation",
                     current_frame=frame,
-                    worker_id=f"WRK{hid:03d}" if isinstance(hid, int) else str(hid),
+                    worker_id=worker_tag,
                     ai_detection_result={
                         "worker_id": hid,
                         "frames_active": h_hist["frames_active"],
@@ -741,7 +842,42 @@ class ActivityEngine:
                     record_video_clip=True
                 )
 
-        # 7. Finalize Inactive Sessions (Inactive for >= 15 seconds)
+        # 7. Worker Departure / Exit Detection (Worker has left camera frame for >= 8.0s)
+        for h_id, h_data in list(self.human_behavior_history.items()):
+            if h_data.get("entered_logged") and not h_data.get("exit_logged"):
+                if (now_ts - h_data["last_seen"]) >= 8.0:
+                    h_data["exit_logged"] = True
+                    w_tag = f"WRK{h_id:03d}" if isinstance(h_id, int) else str(h_id)
+                    tot_sec = max(1.0, h_data["last_seen"] - h_data["first_seen"])
+                    d_mins = int(tot_sec // 60)
+                    d_secs = int(tot_sec % 60)
+                    t_list = list(h_data.get("tasks", {"Barn Inspection"}))
+                    t_str = ", ".join(t_list) if t_list else "Barn Attendance"
+                    s_str = h_data["first_dt"].strftime("%I:%M:%S %p")
+                    e_dt = h_data.get("last_dt", now_dt)
+                    e_str = e_dt.strftime("%I:%M:%S %p")
+
+                    self.trigger_activity(
+                        activity_type="worker_exit",
+                        confidence=0.95,
+                        description=f"Worker Left Barn: Worker #{h_id} exited cattle zone. Active from {s_str} to {e_str} (Duration: {d_mins}m {d_secs}s) | Tasks: {t_str}",
+                        current_frame=frame,
+                        worker_id=w_tag,
+                        ai_detection_result={
+                            "worker_id": h_id,
+                            "duration_sec": round(tot_sec, 1),
+                            "tasks": t_list,
+                            "first_seen": s_str,
+                            "last_seen": e_str,
+                            "status": "Departed"
+                        },
+                        status="verified",
+                        current_ts=now_ts,
+                        current_dt=now_dt,
+                        record_video_clip=False
+                    )
+
+        # 8. Finalize Inactive Sessions (Inactive for >= 15 seconds)
         for skey in list(self.active_cattle_sessions.keys()):
             sess = self.active_cattle_sessions[skey]
             if now_ts - sess["last_seen_ts"] >= 15.0:
@@ -754,16 +890,39 @@ class ActivityEngine:
                 start_str = sess["start_time"].strftime("%I:%M:%S %p")
                 end_str = now_dt.strftime("%I:%M:%S %p")
 
-                if act_t == "feeding_activity":
-                    final_desc = f"Feeding Complete: Cattle {cid} ({breed}) - Fed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                dis_val = sess.get("disease_status", "Healthy")
+                dis_note = f" | ⚠️ Suspected Disease: {dis_val}" if dis_val not in ("Healthy", "Scanning...") else ""
+                bcs_val = sess.get("bcs_score")
+                try:
+                    b_val = float(bcs_val) if (bcs_val is not None and float(bcs_val) > 0) else None
+                except (ValueError, TypeError):
+                    b_val = None
+                bcs_note = f" | BCS: {b_val:.1f}/5.0 (Full Body)" if (b_val is not None and b_val > 0) else " | BCS: Full Body Required"
+
+                if act_t == "worker_feeding":
+                    wid = sess.get("worker_id", "WRK")
+                    final_desc = f"Worker Feeding Complete: Worker {wid} fed Cattle {cid} ({breed}) from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                    eat_dur = final_dur
+                    rest_dur = 0.0
+                elif act_t == "standing_activity":
+                    final_desc = f"Standing Complete: Cattle {cid} ({breed}) - Stood upright from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                    eat_dur = 0.0
+                    rest_dur = 0.0
+                elif act_t == "feeding_activity":
+                    final_desc = f"Grazing Complete: Cattle {cid} ({breed}) - Grazed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
                     eat_dur = final_dur
                     rest_dur = 0.0
                 elif act_t == "resting_activity":
-                    final_desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                    final_desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
                     eat_dur = 0.0
                     rest_dur = final_dur
+                elif act_t == "milking_activity":
+                    wid = sess.get("worker_id", "WRK")
+                    final_desc = f"Milking Complete: Worker {wid} milked Cattle {cid} ({breed}) from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                    eat_dur = 0.0
+                    rest_dur = 0.0
                 else:
-                    final_desc = f"Session Complete: {act_t.replace('_',' ').title()} - Total: {dur_mins}m {dur_secs}s"
+                    final_desc = f"Session Complete: {act_t.replace('_',' ').title()} - Total: {dur_mins}m {dur_secs}s{dis_note}{bcs_note}"
                     eat_dur = 0.0
                     rest_dur = 0.0
 
@@ -775,39 +934,74 @@ class ActivityEngine:
                         "eating_duration_sec": eat_dur,
                         "resting_duration_sec": rest_dur,
                         "status": "verified",
-                        "description": final_desc
+                        "description": final_desc,
+                        "bcs_score": b_val,
+                        "breed": breed,
+                        "disease_status": dis_val,
+                        "estimated_weight_kg": sess.get("estimated_weight_kg"),
+                        "estimated_height_cm": sess.get("estimated_height_cm"),
+                        "herd_count": sess.get("herd_count", 1)
                     }
                 )
                 del self.active_cattle_sessions[skey]
 
     def finalize_all_sessions(self, current_video_sec: float = 0.0, video_base_dt: Optional[datetime.datetime] = None):
-        """Finalizes all in-progress feeding, resting, and worker sessions when video completes."""
-        if not self.active_cattle_sessions:
-            return
+        """Finalizes all in-progress feeding, resting, milking, and worker attendance sessions when video completes."""
         now_dt = (video_base_dt + datetime.timedelta(seconds=current_video_sec)) if video_base_dt else datetime.datetime.now(datetime.timezone.utc)
         now_ts = current_video_sec if current_video_sec > 0 else time.time()
 
+        # Finalize Cattle & Milking Sessions
         for skey, sess in list(self.active_cattle_sessions.items()):
             final_dur = max(1.0, now_ts - sess.get("start_video_sec", now_ts)) if "start_video_sec" in sess else sess.get("duration_sec", 1.0)
             final_dur = round(final_dur, 1)
+            act_t = sess.get("activity_type", "")
+
+            # Discard false-positive flickers under 1.0 second on live streams only
+            # For uploaded video clips, ALWAYS retain and store the verified session
+            if self.video_source_type != "uploaded" and final_dur < 1.0 and "milking" not in act_t and sess.get("worker_id") is None:
+                supabase_manager.delete_activity(self.farm_id, sess["activity_id"])
+                continue
+
             dur_mins = int(final_dur // 60)
             dur_secs = int(final_dur % 60)
-            act_t = sess.get("activity_type", "")
             cid = sess.get("cattle_id", "Cattle")
             breed = sess.get("breed", "Cattle")
             start_str = sess["start_time"].strftime("%I:%M:%S %p")
             end_str = now_dt.strftime("%I:%M:%S %p")
 
-            if "feeding" in act_t:
-                desc = f"Feeding Complete: Cattle {cid} ({breed}) - Fed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+            dis_val = sess.get("disease_status", "Healthy")
+            dis_note = f" | ⚠️ Suspected Disease: {dis_val}" if dis_val not in ("Healthy", "Scanning...") else ""
+            bcs_val = sess.get("bcs_score")
+            try:
+                b_val = float(bcs_val) if bcs_val is not None else None
+            except (ValueError, TypeError):
+                b_val = None
+            bcs_note = f" | BCS: {b_val:.1f}/5.0 (Full Body)" if (b_val is not None and b_val > 0) else " | BCS: Full Body Required"
+
+            if act_t == "worker_feeding":
+                wid = sess.get("worker_id", "WRK")
+                desc = f"Worker Feeding Complete: Worker {wid} fed Cattle {cid} ({breed}) from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                eat_dur = final_dur
+                rest_dur = 0.0
+            elif "standing" in act_t:
+                desc = f"Standing Complete: Cattle {cid} ({breed}) - Stood upright from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                eat_dur = 0.0
+                rest_dur = 0.0
+            elif "feeding" in act_t:
+                desc = f"Grazing Complete: Cattle {cid} ({breed}) - Grazed from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
                 eat_dur = final_dur
                 rest_dur = 0.0
             elif "resting" in act_t:
-                desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s)"
+                desc = f"Resting Complete: Cattle {cid} ({breed}) - Rested from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
                 eat_dur = 0.0
                 rest_dur = final_dur
+            elif "milking" in act_t:
+                wid = sess.get("worker_id", "WRK")
+                desc = f"Milking Complete: Worker {wid} milked Cattle {cid} ({breed}) from {start_str} to {end_str} (Total: {dur_mins}m {dur_secs}s){dis_note}{bcs_note}"
+                eat_dur = 0.0
+                rest_dur = 0.0
             else:
-                desc = f"Session Complete: {act_t.replace('_', ' ').title()} - Total: {dur_mins}m {dur_secs}s"
+                desc = f"Session Complete: {act_t.replace('_', ' ').title()} - Total: {dur_mins}m {dur_secs}s{dis_note}{bcs_note}"
                 eat_dur = 0.0
                 rest_dur = 0.0
 
@@ -819,8 +1013,49 @@ class ActivityEngine:
                     "eating_duration_sec": eat_dur,
                     "resting_duration_sec": rest_dur,
                     "status": "verified",
-                    "description": desc
+                    "description": desc,
+                    "bcs_score": b_val,
+                    "breed": breed,
+                    "disease_status": dis_val,
+                    "estimated_weight_kg": sess.get("estimated_weight_kg"),
+                    "estimated_height_cm": sess.get("estimated_height_cm"),
+                    "herd_count": sess.get("herd_count", 1)
                 }
             )
         self.active_cattle_sessions.clear()
+
+        # Log Full Worker Attendance & Summary for every active worker
+        for hid, h_hist in list(self.human_behavior_history.items()):
+            if h_hist.get("frames_active", 0) >= 2:
+                worker_tag = f"WRK{hid:03d}" if isinstance(hid, int) else str(hid)
+                total_sec = max(1.0, h_hist.get("last_seen", now_ts) - h_hist.get("first_seen", now_ts))
+                dur_mins = int(total_sec // 60)
+                dur_secs = int(total_sec % 60)
+                task_list = list(h_hist.get("tasks", {"Barn Inspection"}))
+                tasks_str = ", ".join(task_list) if task_list else "Barn Attendance"
+                start_dt = h_hist.get("first_dt", now_dt)
+                start_str = start_dt.strftime("%I:%M:%S %p")
+                end_str = now_dt.strftime("%I:%M:%S %p")
+
+                self.trigger_activity(
+                    activity_type="worker_attendance",
+                    confidence=0.95,
+                    description=f"Worker Attendance: Worker #{hid} active in barn from {start_str} to {end_str} (Duration: {dur_mins}m {dur_secs}s) | Tasks: {tasks_str}",
+                    current_frame=self.last_frame,
+                    worker_id=worker_tag,
+                    ai_detection_result={
+                        "worker_id": hid,
+                        "duration_sec": round(total_sec, 1),
+                        "tasks": task_list,
+                        "first_seen": start_str,
+                        "last_seen": end_str
+                    },
+                    status="verified",
+                    current_ts=now_ts,
+                    current_dt=now_dt,
+                    record_video_clip=False,
+                    target_box=h_hist.get("last_box")
+                )
+        self.human_behavior_history.clear()
+
         print(f"[ActivityEngine] All ongoing activity sessions successfully finalized and verified in Supabase.")

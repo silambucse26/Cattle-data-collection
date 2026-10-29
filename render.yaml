@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: pashux-ai-cattle-backend
+    runtime: docker
+    plan: standard # 2GB RAM minimum recommended for PyTorch + YOLO + OpenCV models
+    region: oregon # or frankfurt, singapore
+    healthCheckPath: /
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FARM_ID
+        sync: false
+      - key: CAMERA_ID
+        value: CAM01
+      - key: JWT_SECRET
+        generateValue: true
+      - key: STORAGE_BUCKET_IMAGES
+        value: pashux-activity-images
+      - key: STORAGE_BUCKET_VIDEOS
+        value: pashux-activity-videos

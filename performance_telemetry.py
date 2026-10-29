@@ -28,7 +28,8 @@ class PerformanceProfiler:
         self.total_breed_time = 0.0
         self.total_bcs_time = 0.0
         self.total_disease_time = 0.0
-        self.model_calls = {"det": 0, "breed": 0, "bcs": 0, "disease": 0}
+        self.total_estrus_time = 0.0
+        self.model_calls = {"det": 0, "breed": 0, "bcs": 0, "disease": 0, "estrus": 0}
 
     def record_inference(self, model_name: str, duration_sec: float):
         if model_name == "det":
@@ -43,6 +44,9 @@ class PerformanceProfiler:
         elif model_name == "disease":
             self.total_disease_time += duration_sec
             self.model_calls["disease"] += 1
+        elif model_name == "estrus":
+            self.total_estrus_time += duration_sec
+            self.model_calls["estrus"] += 1
 
     def step_frame(self, active_jobs_count: int = 1) -> Optional[Dict[str, Any]]:
         self.frames_analyzed += 1
@@ -77,6 +81,7 @@ class PerformanceProfiler:
         breed_avg_ms = round((self.total_breed_time / max(1, self.model_calls["breed"])) * 1000, 1) if self.model_calls["breed"] else 0.0
         bcs_avg_ms = round((self.total_bcs_time / max(1, self.model_calls["bcs"])) * 1000, 1) if self.model_calls["bcs"] else 0.0
         disease_avg_ms = round((self.total_disease_time / max(1, self.model_calls["disease"])) * 1000, 1) if self.model_calls["disease"] else 0.0
+        estrus_avg_ms = round((self.total_estrus_time / max(1, self.model_calls["estrus"])) * 1000, 1) if self.model_calls["estrus"] else 0.0
 
         summary = {
             "frames_analyzed": self.frames_analyzed,
@@ -86,10 +91,12 @@ class PerformanceProfiler:
             "breed_avg_ms": breed_avg_ms,
             "bcs_avg_ms": bcs_avg_ms,
             "disease_avg_ms": disease_avg_ms,
+            "estrus_avg_ms": estrus_avg_ms,
             "specialist_calls": {
                 "breed": self.model_calls["breed"],
                 "bcs": self.model_calls["bcs"],
-                "disease": self.model_calls["disease"]
+                "disease": self.model_calls["disease"],
+                "estrus": self.model_calls["estrus"]
             },
             "ram_used_mb": ram_used_mb,
             "sys_ram_available_gb": sys_ram_avail_gb,
@@ -100,7 +107,8 @@ class PerformanceProfiler:
         print(
             f"[PERF] Analyzed FPS: {fps} | YOLO: {det_avg_ms}ms | "
             f"Breed({self.model_calls['breed']}): {breed_avg_ms}ms | BCS({self.model_calls['bcs']}): {bcs_avg_ms}ms | "
-            f"Disease({self.model_calls['disease']}): {disease_avg_ms}ms | RAM: {ram_used_mb}MB | GPU: {gpu_stat} | Jobs: {active_jobs_count}"
+            f"Disease({self.model_calls['disease']}): {disease_avg_ms}ms | Estrus({self.model_calls['estrus']}): {estrus_avg_ms}ms | "
+            f"RAM: {ram_used_mb}MB | GPU: {gpu_stat} | Jobs: {active_jobs_count}"
         )
         return summary
 
